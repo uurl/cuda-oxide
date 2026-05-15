@@ -85,13 +85,75 @@ fn export_addressof_uses_symbol_when_definition_block_prints_later() {
     func.get_operation().insert_at_back(module_block, &ctx);
 
     let ir = export_module_to_string(&ctx, &module).expect("export succeeds");
+
+    // The shared global must be declared at module scope.
+    assert!(
+        ir.contains("@__shared_mem_20 = addrspace(3) global"),
+        "module must declare the shared global:\n{ir}"
+    );
+
+    // The GEP base operand must be the global symbol, not a stale `%vN`.
     let gep_line = ir
         .lines()
         .find(|line| line.contains("getelementptr inbounds"))
         .expect("exported GEP line");
-
     assert!(
         gep_line.contains("@__shared_mem_20"),
         "GEP must use the global symbol, not a stale temporary:\n{ir}"
+    );
+
+    // Bug class from issue #54: every `%vN` reference in the IR must have a
+    // matching `%vN = ...` definition. With the bug present the addressof
+    // result was named `%v1` but never defined; this catches that and any
+    // future regression that re-introduces a dangling SSA reference.
+    assert_no_undefined_temporaries(&ir);
+}
+
+/// Scans the textual LLVM IR and asserts that every `%vN` token appearing in
+/// an operand position has a corresponding `%vN = ...` definition somewhere
+/// in the module. Operates on `%v` temporaries only because that's the
+/// exporter's naming scheme; named values like `%entry` (block labels) are
+/// ignored by construction.
+fn assert_no_undefined_temporaries(ir: &str) {
+    use std::collections::HashSet;
+
+    let mut defined: HashSet<String> = HashSet::new();
+    for line in ir.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("%v") {
+            continue;
+        }
+        let Some((lhs, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        defined.insert(lhs.trim().to_string());
+    }
+
+    let mut referenced: HashSet<String> = HashSet::new();
+    for line in ir.lines() {
+        let trimmed = line.trim_start();
+        // Skip the lhs of a definition; only operand positions can be stale.
+        let body = if trimmed.starts_with("%v")
+            && let Some(eq) = trimmed.find('=')
+        {
+            &trimmed[eq + 1..]
+        } else {
+            trimmed
+        };
+        for tok in body.split(|c: char| !c.is_alphanumeric() && c != '%' && c != '_') {
+            if let Some(num) = tok.strip_prefix("%v")
+                && !num.is_empty()
+                && num.chars().all(|c| c.is_ascii_digit())
+            {
+                referenced.insert(format!("%v{num}"));
+            }
+        }
+    }
+
+    let mut undefined: Vec<&String> = referenced.difference(&defined).collect();
+    undefined.sort();
+    assert!(
+        undefined.is_empty(),
+        "IR references undefined SSA temporaries: {undefined:?}\nIR:\n{ir}"
     );
 }

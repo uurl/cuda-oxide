@@ -212,7 +212,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         let len = data.len();
         let num_bytes = std::mem::size_of_val(data);
 
-        let ptr = unsafe { crate::memory::malloc_async(stream.cu_stream(), num_bytes)? };
+        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
         unsafe {
             crate::memory::memcpy_htod_async(ptr, data.as_ptr(), num_bytes, stream.cu_stream())?;
         }
@@ -269,7 +269,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         let ctx = stream.context().clone();
         let num_bytes = len * std::mem::size_of::<T>();
 
-        let ptr = unsafe { crate::memory::malloc_async(stream.cu_stream(), num_bytes)? };
+        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
         if num_bytes > 0 {
             unsafe {
                 crate::memory::memset_d8_async(ptr, 0, num_bytes, stream.cu_stream())?;

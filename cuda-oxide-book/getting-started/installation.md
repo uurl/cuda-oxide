@@ -164,6 +164,16 @@ sudo apt install libclang-21-dev libclang-cpp21-dev libclang-common-21-dev
 
 `cargo oxide doctor` catches this up front; the symptom otherwise is `'stddef.h' file not found` during the host build.
 
+:::{tip}
+**If doctor still reports clang not found:**
+The issue may be that the versioned binary (e.g., clang-21) is installed but not mapped to the unversioned clang command required by bindgen. You can fix this by installing the clang meta-package, which manages these dependencies automatically:
+
+```bash
+sudo apt install clang libclang-dev
+```
+
+:::
+
 :::{note}
 **Fresh Ubuntu 24.04 / DGX-OS:** after installing LLVM 21 via `apt.llvm.org/llvm.sh` as shown above, the versioned `clang-21` / `clang++-21` binaries are present but the unversioned aliases `cargo oxide doctor` looks for are not. Add them with `update-alternatives`:
 

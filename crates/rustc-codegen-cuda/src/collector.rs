@@ -427,6 +427,10 @@ fn is_intrinsic_lowered_cmath_shim(fn_path: &str) -> bool {
             | "std::sys::cmath::atan2"
             | "std::sys::cmath::atanf"
             | "std::sys::cmath::atan"
+            | "std::sys::cmath::cbrtf"
+            | "std::sys::cmath::cbrt"
+            | "core::num::imp::libm::cbrtf"
+            | "core::num::imp::libm::cbrt"
     )
 }
 

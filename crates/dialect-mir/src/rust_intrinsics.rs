@@ -143,3 +143,7 @@ pub const CALLEE_ATAN2_F64: &str = placeholder!("atan2f64");
 pub const CALLEE_ATAN_F32: &str = placeholder!("atanf32");
 /// Placeholder call used for `f64::atan` / `std::sys::cmath::atan`.
 pub const CALLEE_ATAN_F64: &str = placeholder!("atanf64");
+/// Placeholder call used for `f32::cbrt` / `std::sys::cmath::cbrtf`.
+pub const CALLEE_CBRT_F32: &str = placeholder!("cbrtf32");
+/// Placeholder call used for `f64::cbrt` / `std::sys::cmath::cbrt`.
+pub const CALLEE_CBRT_F64: &str = placeholder!("cbrtf64");

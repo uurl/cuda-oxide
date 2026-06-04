@@ -113,6 +113,10 @@ pub enum RustFloatMathIntrinsic {
     AtanF32,
     /// `f64::atan` / `std::sys::cmath::atan`.
     AtanF64,
+    /// `f32::cbrt` / `std::sys::cmath::cbrtf`.
+    CbrtF32,
+    /// `f64::cbrt` / `std::sys::cmath::cbrt`.
+    CbrtF64,
 }
 
 impl RustFloatMathIntrinsic {
@@ -182,6 +186,10 @@ impl RustFloatMathIntrinsic {
             "std::sys::cmath::atan2" => Some(Self::Atan2F64),
             "std::sys::cmath::atanf" => Some(Self::AtanF32),
             "std::sys::cmath::atan" => Some(Self::AtanF64),
+            "std::sys::cmath::cbrtf" => Some(Self::CbrtF32),
+            "std::sys::cmath::cbrt" => Some(Self::CbrtF64),
+            "core::num::imp::libm::cbrtf" => Some(Self::CbrtF32),
+            "core::num::imp::libm::cbrt" => Some(Self::CbrtF64),
             _ => None,
         }
     }
@@ -236,6 +244,8 @@ impl RustFloatMathIntrinsic {
             Self::Atan2F64 => rust_intrinsics::CALLEE_ATAN2_F64,
             Self::AtanF32 => rust_intrinsics::CALLEE_ATAN_F32,
             Self::AtanF64 => rust_intrinsics::CALLEE_ATAN_F64,
+            Self::CbrtF32 => rust_intrinsics::CALLEE_CBRT_F32,
+            Self::CbrtF64 => rust_intrinsics::CALLEE_CBRT_F64,
         }
     }
 }
@@ -326,6 +336,27 @@ mod tests {
             RustFloatMathIntrinsic::from_core_path("core::intrinsics::minimumf32"),
             None
         );
+    }
+
+    /// `f{32,64}::cbrt` reaches device codegen as either the `std::sys::cmath`
+    /// C shim or the in-tree pure-Rust libm path, depending on toolchain.
+    /// Both must map to the libdevice-backed `Cbrt*` variants; pin them so a
+    /// rustc rename surfaces as a test failure rather than an undefined-symbol
+    /// PTX verification error.
+    #[test]
+    fn from_core_path_recognizes_cbrt_via_cmath_and_libm() {
+        for (path, expected) in [
+            ("std::sys::cmath::cbrtf", RustFloatMathIntrinsic::CbrtF32),
+            ("std::sys::cmath::cbrt", RustFloatMathIntrinsic::CbrtF64),
+            ("core::num::imp::libm::cbrtf", RustFloatMathIntrinsic::CbrtF32),
+            ("core::num::imp::libm::cbrt", RustFloatMathIntrinsic::CbrtF64),
+        ] {
+            assert_eq!(
+                RustFloatMathIntrinsic::from_core_path(path),
+                Some(expected),
+                "`{path}` did not map to the expected cbrt intrinsic"
+            );
+        }
     }
 
     #[test]

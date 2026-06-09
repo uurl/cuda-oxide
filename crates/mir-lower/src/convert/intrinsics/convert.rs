@@ -50,7 +50,7 @@ pub(crate) fn convert_cvt_f16x2_f32(
         vec![lo_val, hi_val],
         "cvt.rn.f16x2.f32 $0, $2, $1;",
         "=r,f,f",
-        false,
+        false, // not convergent — pure data conversion
     );
 
     let asm_op = inline_asm.get_operation();

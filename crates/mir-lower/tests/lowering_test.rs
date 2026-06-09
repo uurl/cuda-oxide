@@ -713,3 +713,145 @@ fn test_cmp_predicate_lowering() -> Result<(), anyhow::Error> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Helper: build a void-returning kernel with a single NVVM op, lower it, and
+// assert the kernel body contains an InlineAsmOp whose template includes the
+// given `expected_asm` substring.
+// ---------------------------------------------------------------------------
+
+/// Build a kernel whose entry block contains `op` + `mir.return`, lower to LLVM,
+/// and verify an `InlineAsmOp` with `expected_asm` in its template exists.
+fn assert_inline_asm_lowering(
+    ctx: &mut Context,
+    module_ptr: pliron::context::Ptr<Operation>,
+    expected_asm: &str,
+) -> Result<(), anyhow::Error> {
+    mir_lower::lower_mir_to_llvm(ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut found = false;
+    let module_op = module_ptr.deref(ctx);
+    let region = module_op.get_region(0);
+    let block = region.deref(ctx).iter(ctx).next().unwrap();
+
+    for op in block.deref(ctx).iter(ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(ctx).to_string() != "kernel_func" {
+            continue;
+        }
+        let func_region = func_op.get_operation().deref(ctx).get_region(0);
+        for func_block in func_region.deref(ctx).iter(ctx) {
+            for body_op in func_block.deref(ctx).iter(ctx) {
+                if let Some(inline_asm) =
+                    Operation::get_op::<llvm::InlineAsmOp>(body_op, ctx)
+                    && inline_asm
+                        .get_attr_inline_asm_template(ctx)
+                        .is_some_and(|s| String::from((*s).clone()).contains(expected_asm))
+                {
+                    found = true;
+                }
+            }
+        }
+    }
+
+    assert!(
+        found,
+        "Expected inline asm containing `{expected_asm}` in lowered kernel"
+    );
+    Ok(())
+}
+
+/// Helper: fresh context with all dialects registered.
+fn make_test_ctx() -> Context {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    dialect_nvvm::register(&mut ctx);
+    mir_lower::register(&mut ctx);
+    ctx
+}
+
+/// Helper: build a module + MirFuncOp("kernel_func") with given arg types,
+/// returning the module ptr and entry block.
+fn build_test_kernel(
+    ctx: &mut Context,
+    arg_tys: Vec<pliron::context::Ptr<pliron::r#type::TypeObj>>,
+) -> (
+    pliron::context::Ptr<Operation>,
+    pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+) {
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::attributes::TypeAttr;
+    use pliron::builtin::types::FunctionType;
+
+    let module = ModuleOp::new(ctx, "test_module".try_into().unwrap());
+    let module_ptr = module.get_operation();
+
+    let func_ty = FunctionType::get(ctx, arg_tys.clone(), vec![]);
+    let func_op_ptr = Operation::new(
+        ctx,
+        mir::MirFuncOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        1,
+    );
+    let func = mir::MirFuncOp::new(ctx, func_op_ptr, TypeAttr::new(func_ty.into()));
+    func.set_symbol_name(ctx, "kernel_func".try_into().unwrap());
+
+    let region = func.get_operation().deref(ctx).get_region(0);
+    let entry = BasicBlock::new(ctx, None, arg_tys);
+    entry.insert_at_back(region, ctx);
+
+    let module_region = module_ptr.deref(ctx).get_region(0);
+    let module_block = module_region.deref(ctx).iter(ctx).next().unwrap();
+    func.get_operation().insert_at_back(module_block, ctx);
+
+    (module_ptr, entry)
+}
+
+/// Helper: append a mir.return (void) to a block.
+fn append_return(ctx: &mut Context, block: pliron::context::Ptr<pliron::basic_block::BasicBlock>) {
+    let ret = Operation::new(
+        ctx,
+        mir::MirReturnOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    ret.insert_at_back(block, ctx);
+}
+
+// ---------------------------------------------------------------------------
+// cvt.f16x2 intrinsic lowering test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cvt_f16x2_f32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&mut ctx);
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let (module_ptr, entry) =
+        build_test_kernel(&mut ctx, vec![f32_ty.into(), f32_ty.into()]);
+
+    let lo_val = entry.deref(&ctx).get_argument(0);
+    let hi_val = entry.deref(&ctx).get_argument(1);
+
+    // CvtF16x2F32Op: 2 f32 operands, 1 i32 result
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::CvtF16x2F32Op::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![lo_val, hi_val],
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    assert_inline_asm_lowering(&mut ctx, module_ptr, "cvt.rn.f16x2.f32")
+}

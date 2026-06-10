@@ -66,32 +66,11 @@ pub fn translate_statement(
 
     match &stmt.kind {
         mir::StatementKind::Assign(place, rvalue) => {
-            let expected_result_type =
-                if matches!(rvalue, mir::Rvalue::BinaryOp(mir::BinOp::Cmp, _, _)) {
-                    let dest_ty = if place.projection.is_empty() {
-                        body.locals()[place.local].ty
-                    } else {
-                        place.ty(body.locals()).map_err(|e| {
-                            pliron::input_error!(
-                                loc.clone(),
-                                TranslationErr::unsupported(format!(
-                                    "Failed to resolve assignment destination type: {:?}",
-                                    e
-                                ))
-                            )
-                        })?
-                    };
-                    Some(types::translate_type(ctx, &dest_ty)?)
-                } else {
-                    None
-                };
-
             // Translate the Rvalue to get the value being assigned
             let (rvalue_op_opt, result_value, last_inserted) = rvalue::translate_rvalue(
                 ctx,
                 body,
                 rvalue,
-                expected_result_type,
                 value_map,
                 block_ptr,
                 prev_op,

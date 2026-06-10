@@ -250,7 +250,6 @@ pub fn translate_rvalue(
     ctx: &mut Context,
     body: &mir::Body,
     rvalue: &mir::Rvalue,
-    expected_result_type: Option<Ptr<pliron::r#type::TypeObj>>,
     value_map: &mut ValueMap,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
@@ -384,17 +383,37 @@ pub fn translate_rvalue(
                     MirNeOp::get_concrete_op_info(),
                     types::get_bool_type(ctx).to_ptr(),
                 ),
-                mir::BinOp::Cmp => (
-                    MirCmpOp::get_concrete_op_info(),
-                    expected_result_type.ok_or_else(|| {
+                // Three-way comparison (`Ord::cmp`) - returns
+                // `core::cmp::Ordering`. rustc's `BinOp::ty` knows the
+                // result type of every binop (including `Cmp`, for which it
+                // returns the `Ordering` enum), so derive it locally from
+                // the operand types instead of threading the assignment
+                // destination type through every translate_rvalue caller.
+                mir::BinOp::Cmp => {
+                    let left_ty = left.ty(body.locals()).map_err(|e| {
                         pliron::input_error!(
                             loc.clone(),
-                            TranslationErr::unsupported(
-                                "BinaryOp Cmp requires the assignment destination type"
-                            )
+                            TranslationErr::unsupported(format!(
+                                "Failed to resolve BinOp::Cmp lhs type: {:?}",
+                                e
+                            ))
                         )
-                    })?,
-                ),
+                    })?;
+                    let right_ty = right.ty(body.locals()).map_err(|e| {
+                        pliron::input_error!(
+                            loc.clone(),
+                            TranslationErr::unsupported(format!(
+                                "Failed to resolve BinOp::Cmp rhs type: {:?}",
+                                e
+                            ))
+                        )
+                    })?;
+                    let ordering_ty = bin_op.ty(left_ty, right_ty);
+                    (
+                        MirCmpOp::get_concrete_op_info(),
+                        types::translate_type(ctx, &ordering_ty)?,
+                    )
+                }
 
                 // Pointer offset - ptr.add(n) returns ptr + n * sizeof(element)
                 mir::BinOp::Offset => (

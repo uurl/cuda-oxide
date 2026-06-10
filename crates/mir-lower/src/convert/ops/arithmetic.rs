@@ -616,9 +616,15 @@ pub(crate) fn convert_not(
 
 /// Convert MIR comparison to `llvm.icmp` (integer) or `llvm.fcmp` (float).
 ///
-/// Integer comparisons use signed or unsigned predicates based on pre-conversion
-/// MIR operand type signedness. Float comparisons use ordered predicates
-/// (olt, ole, etc.) which return false if either operand is NaN.
+/// Integer comparisons use signed or unsigned predicates based on
+/// pre-conversion MIR operand type signedness.
+///
+/// Float predicates mirror rustc_codegen_ssa's `bin_op_to_fcmp_predicate`:
+/// `Eq -> oeq`, `Lt -> olt`, `Le -> ole`, `Gt -> ogt`, `Ge -> oge` (ordered,
+/// false if either operand is NaN), and `Ne -> une` (UNordered, true if
+/// either operand is NaN) so that `a != b` equals `!(a == b)` per Rust
+/// `PartialEq` semantics. An ordered `one` here folds the canonical NaN
+/// check `x != x` to `false` (issue #123).
 pub(crate) fn convert_cmp(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -774,7 +780,7 @@ fn emit_discriminant_const(
     Ok(const_op.deref(ctx).get_result(0))
 }
 
-#[cfg(test)]
-mod tests {
-    // TODO: Add unit tests for arithmetic conversion
-}
+// Conversion coverage for this module lives in the crate's integration
+// tests: `tests/lowering_test.rs::test_cmp_predicate_lowering` locks the
+// comparison predicate table (and empty fastmath flags) end-to-end through
+// the DialectConversion framework.

@@ -231,8 +231,8 @@ compiles a Rust kernel to PTX, launches it on the GPU, and prints
 | `vecadd`             | Vector addition -- canonical first example                               |
 | `host_closure`       | Generic kernels with closures passed from host                           |
 | `generic`            | Generic kernels with monomorphization (`scale<T>`)                       |
-| `ord_cmp`            | Device-side `Ord::cmp` lowering for signed and unsigned integers          |
-| `gemm_sol`           | GEMM SoL: 868 TFLOPS (58% cuBLAS on B200), 8 kernels across 4 phases     |
+| `ord_cmp`            | Device-side `Ord::cmp` lowering for signed and unsigned integers         |
+| `gemm_sol`           | GEMM SoL: 868 TFLOPS, 58% cublasLt SoL on B200 (148 SMs); 8 kernels      |
 | `tcgen05`            | Blackwell tensor cores (sm_100a): TMEM, MMA, cta_group::2                |
 | `atomics`            | GPU atomics: 6 types x 3 scopes x 5 orderings (20 tests)                 |
 | `cluster`            | Thread Block Clusters + DSMEM ring exchange (Hopper+)                    |
@@ -301,7 +301,7 @@ cargo oxide run gemm_sol
 - MathDx integration: cuFFTDx thread-level FFT, cuBLASDx block-level GEMM
 - Tile interop (experimental): [`cutile_inter_kernel`](crates/rustc-codegen-cuda/examples/cutile_inter_kernel/README.md) chains a cutile-rs Tile kernel and a cuda-oxide SIMT PTX kernel on the same CUDA stream over shared device tensors. Intra-kernel Tile interop is work in progress and tracked in [#96](https://github.com/NVlabs/cuda-oxide/issues/96).
 - Host runtime: `cuda-core` (explicit control, pinned host transfers) and `cuda-async` (composable async operations)
-- GEMM SoL: 868 TFLOPS (58% cuBLAS SoL) on B200 with cta_group::2, CLC, 4-stage pipeline
+- GEMM SoL: 868 TFLOPS (58% of cublasLt FP16 SoL) on B200 (148 SMs) with cta_group::2 + CLC + 4-stage pipeline (`gemm_sol` example measures the cublasLt baseline live via `bench/cublaslt_bench` — absolute TFLOPS scale with SM count on smaller Blackwell DC SKUs; per-phase tables for both 148-SM and 80-SM variants are in `crates/rustc-codegen-cuda/examples/gemm_sol/README.md`)
 
 ## Documentation
 

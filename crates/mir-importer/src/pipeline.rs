@@ -780,6 +780,44 @@ fn select_target(features: DetectedFeatures) -> &'static str {
     }
 }
 
+/// Does `arch` (e.g. `"sm_120a"`, `"sm_90"`) support the kernel's detected
+/// features?
+///
+/// tcgen05/TMEM and `cta_group` TMA multicast exist only in the sm_100
+/// datacenter-Blackwell family: consumer Blackwell (sm_120) and Hopper (sm_90)
+/// lack them, so an sm_120 GPU cannot run an sm_100 tcgen05 kernel even though
+/// 120 > 100. WGMMA is Hopper-only. The remaining features are forward
+/// compatible from their floor (TMA / cluster need sm_90+, basic needs sm_80+).
+///
+/// Used to decide whether the GPU in this machine (the `CUDA_OXIDE_DEVICE_ARCH`
+/// hint) can actually run the kernel, or whether we must build for the arch the
+/// IR requires instead.
+fn arch_satisfies(arch: &str, features: DetectedFeatures) -> bool {
+    let Some(major) = arch_major(arch) else {
+        return false;
+    };
+    match features {
+        DetectedFeatures::Blackwell | DetectedFeatures::TmaMulticast => major == 10,
+        DetectedFeatures::Wgmma => major == 9,
+        DetectedFeatures::Tma | DetectedFeatures::Cluster => major >= 9,
+        DetectedFeatures::Basic => major >= 8,
+    }
+}
+
+/// Extract the compute-capability *major* version from an `sm_…` target string.
+///
+/// CUDA concatenates major+minor without a separator, so `"sm_120a"` is cc 12.0
+/// (major 12), `"sm_90"` is cc 9.0, `"sm_103a"` is cc 10.3. We read the digit
+/// run after `sm_` and divide by ten. Returns `None` when there are no digits.
+fn arch_major(arch: &str) -> Option<u32> {
+    let digits: String = arch
+        .trim_start_matches("sm_")
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u32>().ok().map(|n| n / 10)
+}
+
 /// Runs LLVM's middle-end (`opt -O2`) on the emitted IR before `llc`.
 ///
 /// This is what consumes the per-op ABI alignment we emit: the
@@ -865,11 +903,17 @@ fn optimize_ll(ll_path: &Path, verbose: bool) -> Option<std::path::PathBuf> {
 /// group parameter requires LLVM 21). If `CUDA_OXIDE_LLC` is set, it is used
 /// exclusively — power users can point this at an older `llc` at their own
 /// risk (most examples will still compile but modern intrinsics will not).
-/// Auto-detects GPU features to select target, or uses `CUDA_OXIDE_TARGET`
-/// if set.
+///
+/// Target arch resolves (highest priority first) to: an explicit
+/// `CUDA_OXIDE_TARGET` override, else the detected-GPU hint
+/// (`CUDA_OXIDE_DEVICE_ARCH`) when that GPU can run the kernel, else the minimum
+/// arch the IR's features require (`select_target`).
 fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError> {
-    // Check for user-specified target override
-    let target_override = std::env::var("CUDA_OXIDE_TARGET").ok();
+    // Explicit, hard override: `--arch` or a parent-set `CUDA_OXIDE_TARGET`.
+    let explicit_override = std::env::var("CUDA_OXIDE_TARGET").ok();
+    // Advisory hint: the arch of the GPU in this machine, forwarded by
+    // `cargo oxide run`. Used only when that GPU can actually run the kernel.
+    let device_hint = std::env::var("CUDA_OXIDE_DEVICE_ARCH").ok();
 
     // Detect features (order matters: most specific first)
     let detected = match (
@@ -887,18 +931,36 @@ fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError
         _ => DetectedFeatures::Basic,
     };
 
-    // Use override if provided, otherwise auto-detect
-    let target = match &target_override {
-        Some(t) => t.as_str(),
-        None => select_target(detected),
+    // Arch the IR actually requires (the hard floor).
+    let feature_arch = select_target(detected);
+
+    // Resolve the final target:
+    //   1. explicit override -- honored as-is. If it cannot lower the kernel's
+    //      features we warn (otherwise llc aborts with a cryptic backend error).
+    //   2. detected-device hint -- used only if that GPU can run the kernel;
+    //      otherwise we build for `feature_arch`. The resulting PTX will not
+    //      load on this GPU, but feature-gated examples handle that at load time
+    //      (cuModuleLoad reports INVALID_PTX and they skip execution).
+    //   3. neither set -- the feature floor.
+    let (target, target_source): (String, &str) = if let Some(t) = explicit_override {
+        if !arch_satisfies(&t, detected) {
+            eprintln!(
+                "warning: CUDA_OXIDE_TARGET={t} cannot lower the detected feature \
+                 {detected:?} (needs {feature_arch}); PTX generation will likely \
+                 fail. Unset CUDA_OXIDE_TARGET to let cuda-oxide select \
+                 {feature_arch} automatically."
+            );
+        }
+        (t, "CUDA_OXIDE_TARGET")
+    } else if let Some(dev) = device_hint.filter(|d| arch_satisfies(d, detected)) {
+        (dev, "detected GPU")
+    } else {
+        (feature_arch.to_string(), "feature requirement")
     };
 
     // Log target selection
     if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
-        match &target_override {
-            Some(_) => eprintln!("Target: {} (from CUDA_OXIDE_TARGET)", target),
-            None => eprintln!("Target: {} (auto-detected: {:?})", target, detected),
-        }
+        eprintln!("Target: {target} (from {target_source}; detected {detected:?})");
     }
 
     let verbose = std::env::var("CUDA_OXIDE_VERBOSE").is_ok();
@@ -968,13 +1030,13 @@ fn generate_ptx(ll_path: &Path, ptx_path: &Path) -> Result<String, PipelineError
     //   - sm_90a:  Hopper only (WGMMA + TMA) - NOT forward-compatible
     //   - sm_120:  Blackwell consumer (TMA with PTX 8.7)
     //   - sm_80:   Ampere+ (maximum compatibility)
-    let llc_candidates = [("llc-22", target), ("llc-21", target)];
+    let llc_candidates = [("llc-22", target.as_str()), ("llc-21", target.as_str())];
 
     let mut last_error = String::new();
 
     for (llc_cmd, llc_target) in llc_path
         .as_deref()
-        .map(|s| (s, target))
+        .map(|s| (s, target.as_str()))
         .into_iter()
         .chain(llc_candidates)
     {
@@ -1196,6 +1258,57 @@ mod tests {
         assert_eq!(select_target(DetectedFeatures::Tma), "sm_100");
         assert_eq!(select_target(DetectedFeatures::Cluster), "sm_90");
         assert_eq!(select_target(DetectedFeatures::Basic), "sm_80");
+    }
+
+    #[test]
+    fn test_arch_major_parses_cuda_spelling() {
+        assert_eq!(arch_major("sm_75"), Some(7));
+        assert_eq!(arch_major("sm_80"), Some(8));
+        assert_eq!(arch_major("sm_90a"), Some(9));
+        assert_eq!(arch_major("sm_100a"), Some(10));
+        assert_eq!(arch_major("sm_103a"), Some(10));
+        assert_eq!(arch_major("sm_120a"), Some(12));
+        assert_eq!(arch_major("nvvm-ir"), None);
+        assert_eq!(arch_major("sm_"), None);
+    }
+
+    #[test]
+    fn test_arch_satisfies_sm100_only_features() {
+        // tcgen05 and cta_group TMA multicast are sm_100-family only:
+        // consumer Blackwell (sm_120) and Hopper (sm_90) cannot run them, even
+        // though 120 > 100. This is the gemm_sol regression guard.
+        for f in [DetectedFeatures::Blackwell, DetectedFeatures::TmaMulticast] {
+            assert!(arch_satisfies("sm_100a", f), "sm_100a must satisfy {f:?}");
+            assert!(
+                !arch_satisfies("sm_120a", f),
+                "sm_120a must NOT satisfy {f:?}"
+            );
+            assert!(
+                !arch_satisfies("sm_90a", f),
+                "sm_90a must NOT satisfy {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_arch_satisfies_wgmma_is_hopper_only() {
+        assert!(arch_satisfies("sm_90a", DetectedFeatures::Wgmma));
+        assert!(!arch_satisfies("sm_100a", DetectedFeatures::Wgmma));
+        assert!(!arch_satisfies("sm_120a", DetectedFeatures::Wgmma));
+    }
+
+    #[test]
+    fn test_arch_satisfies_forward_compatible_features() {
+        // Plain TMA / cluster lower on any sm_90+ device; basic on any sm_80+.
+        // So a consumer sm_120 GPU is a valid target for these (it runs locally
+        // instead of being downgraded to the feature floor).
+        for arch in ["sm_90a", "sm_100a", "sm_120a"] {
+            assert!(arch_satisfies(arch, DetectedFeatures::Tma));
+            assert!(arch_satisfies(arch, DetectedFeatures::Cluster));
+            assert!(arch_satisfies(arch, DetectedFeatures::Basic));
+        }
+        assert!(arch_satisfies("sm_80", DetectedFeatures::Basic));
+        assert!(!arch_satisfies("sm_80", DetectedFeatures::Tma));
     }
 
     /// Build a minimal LLVM dialect module containing a single function

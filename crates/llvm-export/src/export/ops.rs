@@ -801,7 +801,6 @@ impl<'a> ModuleExportState<'a> {
             self.export_type(ret_ty, output)?;
         }
 
-        let mut is_convergent = false;
         match callee {
             CallOpCallable::Direct(identifier) => {
                 let name = identifier.to_string();
@@ -811,7 +810,6 @@ impl<'a> ModuleExportState<'a> {
                 } else {
                     super::names::strip_device_prefix(&name)
                 };
-                is_convergent = Self::is_convergent_intrinsic(&fixed);
                 write!(output, " @{fixed}(").unwrap();
             }
             CallOpCallable::Indirect(val) => {
@@ -830,12 +828,13 @@ impl<'a> ModuleExportState<'a> {
             self.export_value(arg, value_names, output)?;
         }
 
-        if is_convergent {
-            writeln!(output, ") #0").unwrap();
-            self.convergent_used = true;
-        } else {
-            writeln!(output, ")").unwrap();
-        }
+        // Every device call is emitted `convergent` (attr group #0). GPU code is
+        // convergent-by-default (as in Clang/nvcc): if the callee transitively
+        // performs a barrier / shuffle / vote, `opt -O2` must not sink or
+        // duplicate the call across divergent control flow. opt strips the
+        // attribute from calls it proves never reach a convergent op.
+        writeln!(output, ") #0").unwrap();
+        self.convergent_used = true;
         Ok(())
     }
 

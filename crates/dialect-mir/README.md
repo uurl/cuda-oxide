@@ -20,13 +20,15 @@ The dialect defines seven types that preserve Rust-level semantics:
 | `MirEnumType`         | Rust enums with discriminant + variant payloads    | `mir.enum<"Ordering", i8, ...>`       |
 | `MirArrayType`        | Fixed-size arrays                                  | `mir.array<f32, 256>`                 |
 
-`MirEnumType` carries the layout-truth tag type (width and signedness
-from rustc's layout), the variant names, the declared discriminant
-VALUES (not variant indices), per-variant field counts, the flattened
-field types, and total size / ABI alignment in bytes (0 = unknown):
+`MirEnumType` records the enum's layout the way rustc computed it: the
+tag's type (width and signedness), the variant names, the declared
+discriminant VALUES (not variant positions), per-variant field counts,
+the field types, where each field and the tag live (byte positions),
+and total size / alignment in bytes (0 = layout not recorded). In
+textual order:
 
 ```text
-mir.enum<"Ordering", si8, ["Less", "Equal", "Greater"], [255, 0, 1], [0, 0, 0], [], 1, 1>
+mir.enum<"Ordering", si8, ["Less", "Equal", "Greater"], [255, 0, 1], [0, 0, 0], [], [], 0, 1, 1>
 ```
 
 `Ordering::Less` is declared as -1, stored as the unsigned i8 bit

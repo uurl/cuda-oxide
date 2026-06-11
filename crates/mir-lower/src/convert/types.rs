@@ -27,7 +27,7 @@
 //! | `MirDisjointSliceType`          | `StructType { ptr, i64 }`         | Same as slice               |
 //! | `MirTupleType`                  | `StructType`                      | Empty tuple → empty struct  |
 //! | `MirStructType`                 | `StructType`                      | Fields recursively converted|
-//! | `MirEnumType`                   | `StructType { discr, fields... }` | Discriminant + all fields   |
+//! | `MirEnumType`                   | `StructType` (rustc byte layout)  | See "Enum Type Representation" |
 //! | `ArrayType`                     | `ArrayType`                       | Element type converted      |
 //! | `VectorType`                    | `VectorType`                      | Element type converted      |
 //!
@@ -67,21 +67,25 @@
 //!
 //! # Enum Type Representation
 //!
-//! Rust enums are represented as structs with the discriminant tag first,
-//! then every variant's payload fields concatenated in declaration order:
+//! A Rust enum is one tag plus the payload of whichever variant is
+//! alive; all variants share the same bytes. We build an LLVM struct
+//! that puts the tag and every payload field at the exact byte position
+//! rustc chose, inserting `[N x i8]` filler for the gaps:
 //!
 //! ```text
-//! MIR: MirEnumType { discriminant: i8, discriminants: [0, 1], variants: [A(), B(i32)] }
-//! LLVM: struct { i8, i32 }  ; tag + concatenated variant fields
+//! #[repr(u32)] enum E { A(u32), B(f32), C }   // rustc: 8 bytes,
+//!                                             // tag at 0, payloads at 4
+//! LLVM: { i32, i32 }   ; slot 0 = tag, slot 1 = A's payload
+//!                      ; B's f32 also lives at byte 4 but has a
+//!                      ; different type, so it is read/written through
+//!                      ; memory instead of owning a slot
 //! ```
 //!
-//! The discriminant type is rustc's layout-truth tag (width and
-//! signedness), and the tag slot stores the variant's DECLARED
-//! discriminant value from `discriminants`, not its variant index.
-//! When rustc's total size is known (Direct-tag enums), the struct is padded
-//! with a trailing `[N x i8]` to match it; multi-payload enums whose
-//! concatenation exceeds rustc's size are rejected at the kernel ABI boundary.
-//! See `convert_enum_to_llvm` in this module.
+//! Because the bytes match rustc exactly, enum data can cross the
+//! host/device boundary safely. The tag slot stores the variant's
+//! DECLARED discriminant value (`enum E { A = 7 }` stores 7), not its
+//! position. See `build_enum_slot_map` in this module for the full
+//! story.
 //!
 //! # Function Type Conversion
 //!
@@ -646,123 +650,314 @@ pub(crate) fn natural_struct_layout(ctx: &Context, fields: &[Ptr<TypeObj>]) -> (
     (end, size, align)
 }
 
-/// Convert a `MirEnumType` to its LLVM struct representation.
+/// The LLVM struct for an enum, plus a map saying where the tag and each
+/// payload field ended up.
 ///
-/// The base model is the concatenated struct `{tag, variant fields...}`
-/// (field 0 is the discriminant; every variant's payload fields follow in
-/// declaration order). When rustc's total size is known (`total_size > 0`,
-/// i.e. Direct-tag enums) the structural size is compared against it:
+/// The struct type and the indices into it are produced by one walk in
+/// [`build_enum_slot_map`], so they can never disagree. (Computing them
+/// separately is how the issue #128 class of bug happened for structs.)
+pub(crate) struct EnumSlotMap {
+    /// The final LLVM struct type, including any `[N x i8]` filler slots.
+    pub llvm_struct_ty: Ptr<TypeObj>,
+    /// Which struct slot holds the tag.
+    pub tag_slot: u32,
+    /// Which struct slot holds each payload field, in the flattened
+    /// order of `MirEnumType::all_field_types`. `None` means the field
+    /// has no slot of its own: it is zero-sized, or its bytes are shared
+    /// with a different-typed field of another variant. Such fields are
+    /// read and written through memory at `field_offsets` instead.
+    pub field_slots: Vec<Option<u32>>,
+    /// Byte position of each payload field inside the enum (copied from
+    /// the type; empty when the layout was not recorded).
+    pub field_offsets: Vec<u64>,
+    /// Converted LLVM type of each payload field.
+    pub field_llvm_types: Vec<Ptr<TypeObj>>,
+}
+
+/// Build the LLVM struct for an enum, placing everything at the byte
+/// positions rustc chose.
 ///
-/// - equal: the concatenated struct already matches; return it unchanged.
-/// - structural < total (trailing shortfall: `repr(align(N))` raises, unit
-///   variants alongside sized payloads elsewhere): append a trailing
-///   `[N x i8]` pad so the LLVM allocation size equals rustc's. Appending at
-///   the END keeps every existing insertvalue/extractvalue index valid; the
-///   pad is simply never written.
-/// - structural > total (multi-payload enums whose variants overlap in Rust
-///   but concatenate in this model, e.g. `#[repr(u32)] enum E { A(u32),
-///   B(u32) }` is 8 bytes in Rust vs 12 structural): padding is impossible,
-///   so the concatenated struct is returned as-is. It stays self-consistent
-///   for ALL device-local use (construct, match, allocas, loads/stores and
-///   GEPs over device-written memory), but payload field OFFSETS remain the
-///   concatenated model, NOT Rust's overlapped layout. Such enums are
-///   therefore rejected at the kernel ABI boundary, where the host side is
-///   laid out with rustc's real layout; see [`enum_memory_divergence`] and
-///   [`find_divergent_enum_in_abi`].
-pub(crate) fn convert_enum_to_llvm(
+/// Why this matters: the host (CPU) lays out enum values with rustc's
+/// layout. If the device used different byte positions, every enum
+/// passed to a kernel would be read wrong. So the device struct is built
+/// to have the same bytes, position for position.
+///
+/// The wrinkle is that enum variants SHARE bytes (only one variant is
+/// alive at a time), and an LLVM struct cannot say "these two fields
+/// overlap". The slot map resolves each field one of three ways:
+///
+/// ```text
+/// #[repr(u32)] enum E { A(u32), B(f32), C }
+/// rustc: 8 bytes, tag at byte 0, A's u32 and B's f32 both at byte 4
+///
+/// LLVM struct: { i32, i32 }
+///                 |     |
+///        tag_slot=0     A's payload: own slot (nothing else typed i32
+///                       wanted byte 4 first... B did, see below)
+///
+/// - own slot:   the field's bytes collide with nothing already placed.
+/// - shared slot: another variant already placed the SAME type at the
+///                SAME position; both map to that slot. (If B were
+///                B(u32), A and B would simply share slot 1.)
+/// - no slot:    the bytes are taken by a different type (B's f32 vs
+///                A's u32 here). The field is still at byte 4, just not
+///                nameable as a struct field; reads and writes go
+///                through memory: spill the value to a stack slot, then
+///                use a byte-precise pointer. No slot, but no lie.
+/// ```
+///
+/// Gaps between placed fields, and the tail, are covered with explicit
+/// `[N x i8]` filler so the struct's size is exactly rustc's no matter
+/// what LLVM's own layout rules would have done.
+///
+/// Niche-encoded enums (`total_size == 0`, layout not recorded) keep the
+/// old simple model instead: `{tag, all fields in order}`. That model is
+/// only used inside kernels and never crosses the host boundary.
+///
+/// If the finished struct's size does not come out equal to rustc's,
+/// something is deeply wrong and lowering would miscompile, so that is a
+/// hard error rather than a debug assertion.
+pub(crate) fn build_enum_slot_map(
     ctx: &mut Context,
     ty: Ptr<TypeObj>,
-) -> Result<Ptr<TypeObj>, anyhow::Error> {
-    let (discriminant_ty, all_field_types, total_size) = {
+) -> Result<EnumSlotMap, anyhow::Error> {
+    let (
+        name,
+        discriminant_ty,
+        all_field_types,
+        all_field_offsets,
+        tag_offset,
+        total_size,
+        abi_align,
+    ) = {
         let ty_ref = ty.deref(ctx);
         let enum_ty = ty_ref
             .downcast_ref::<MirEnumType>()
-            .ok_or_else(|| anyhow::anyhow!("convert_enum_to_llvm: expected MirEnumType"))?;
+            .ok_or_else(|| anyhow::anyhow!("build_enum_slot_map: expected MirEnumType"))?;
         (
+            enum_ty.name().to_string(),
             enum_ty.discriminant_ty,
             enum_ty.all_field_types.clone(),
+            enum_ty.all_field_offsets.clone(),
+            enum_ty.tag_offset(),
             enum_ty.total_size(),
+            enum_ty.abi_align(),
         )
     };
 
     let llvm_discr_ty = convert_type(ctx, discriminant_ty)?;
-    let mut llvm_fields = vec![llvm_discr_ty];
-    for field_ty in all_field_types {
-        llvm_fields.push(convert_type(ctx, field_ty)?);
+    let mut field_llvm_types = Vec::with_capacity(all_field_types.len());
+    for &field_ty in &all_field_types {
+        field_llvm_types.push(convert_type(ctx, field_ty)?);
     }
 
-    if total_size > 0 {
-        let (end, size, _align) = natural_struct_layout(ctx, &llvm_fields);
-        if size < total_size {
-            let padding_ty = make_padding_type(ctx, total_size - end);
-            llvm_fields.push(padding_ty);
+    if total_size == 0 {
+        // Layout not recorded (niche-encoded shapes): keep the simple
+        // {tag, all fields in order} struct. Fine inside a kernel, never
+        // allowed across the host boundary.
+        let mut llvm_fields = vec![llvm_discr_ty];
+        llvm_fields.extend(field_llvm_types.iter().copied());
+        let field_slots = (0..field_llvm_types.len())
+            .map(|i| Some(1 + i as u32))
+            .collect();
+        return Ok(EnumSlotMap {
+            llvm_struct_ty: llvm_types::StructType::get_unnamed(ctx, llvm_fields).into(),
+            tag_slot: 0,
+            field_slots,
+            field_offsets: vec![],
+            field_llvm_types,
+        });
+    }
+
+    if all_field_offsets.len() != all_field_types.len() {
+        return Err(anyhow::anyhow!(
+            "enum slot map: `{}` has {} field offsets for {} fields",
+            name,
+            all_field_offsets.len(),
+            all_field_types.len()
+        ));
+    }
+
+    // Phase 1: decide who gets a struct slot. The tag goes first so a
+    // payload field can never take its bytes.
+    // claims: (byte position, byte size, converted type), no two overlap.
+    let mut claims: Vec<(u64, u64, Ptr<TypeObj>)> = Vec::new();
+    let (tag_size, tag_align) = llvm_type_size_align(ctx, llvm_discr_ty);
+    if tag_offset % tag_align.max(1) != 0 || tag_offset + tag_size > total_size {
+        return Err(anyhow::anyhow!(
+            "enum slot map: `{}` tag (size {}, align {}) cannot sit at byte {} of {}",
+            name,
+            tag_size,
+            tag_align,
+            tag_offset,
+            total_size
+        ));
+    }
+    claims.push((tag_offset, tag_size, llvm_discr_ty));
+    let tag_claim: usize = 0;
+
+    let mut claim_of_field: Vec<Option<usize>> = vec![None; field_llvm_types.len()];
+    let mut order: Vec<usize> = (0..field_llvm_types.len()).collect();
+    order.sort_by_key(|&i| (all_field_offsets[i], i));
+    for flat in order {
+        let llvm_ty = field_llvm_types[flat];
+        let (size, align) = llvm_type_size_align(ctx, llvm_ty);
+        if size == 0 || is_zero_sized_type(ctx, llvm_ty) {
+            // ZSTs own no bytes and no slot.
+            continue;
         }
+        let offset = all_field_offsets[flat];
+        if offset + size > total_size {
+            return Err(anyhow::anyhow!(
+                "enum slot map: `{}` field {} (size {}) at byte {} exceeds total size {}",
+                name,
+                flat,
+                size,
+                offset,
+                total_size
+            ));
+        }
+        // Another variant already placed the same type at the same
+        // position? Then both fields can simply use that slot: variants
+        // share bytes, and here they even agree on the type.
+        if let Some(ci) = claims
+            .iter()
+            .position(|&(o, _, t)| o == offset && t == llvm_ty)
+        {
+            claim_of_field[flat] = Some(ci);
+            continue;
+        }
+        // The bytes are taken by a different type, or the position is
+        // not aligned for this type: no slot. The field keeps its byte
+        // position and is accessed through memory instead.
+        let collides = claims
+            .iter()
+            .any(|&(o, s, _)| offset < o + s && o < offset + size);
+        if collides || offset % align.max(1) != 0 {
+            continue;
+        }
+        claims.push((offset, size, llvm_ty));
+        claim_of_field[flat] = Some(claims.len() - 1);
     }
 
-    Ok(llvm_types::StructType::get_unnamed(ctx, llvm_fields).into())
+    // Phase 2: lay the slots down in byte order, filling every gap (and
+    // the tail) with [N x i8] so the struct's size is exactly rustc's.
+    let mut emit_order: Vec<usize> = (0..claims.len()).collect();
+    emit_order.sort_by_key(|&ci| claims[ci].0);
+    let mut llvm_fields: Vec<Ptr<TypeObj>> = Vec::new();
+    let mut slot_of_claim: Vec<u32> = vec![0; claims.len()];
+    let mut current_offset: u64 = 0;
+    for &ci in &emit_order {
+        let (offset, size, llvm_ty) = claims[ci];
+        if current_offset < offset {
+            llvm_fields.push(make_padding_type(ctx, offset - current_offset));
+            current_offset = offset;
+        }
+        slot_of_claim[ci] = llvm_fields.len() as u32;
+        llvm_fields.push(llvm_ty);
+        current_offset += size;
+    }
+    if current_offset < total_size {
+        llvm_fields.push(make_padding_type(ctx, total_size - current_offset));
+    }
+
+    // Sanity: the struct we just built must be exactly rustc's size.
+    // Arrays of enums step by this size, so a mismatch means every
+    // element after the first is read from the wrong place. That is a
+    // guaranteed miscompile, hence a hard error, not a debug check.
+    let (_end, natural_size, natural_align) = natural_struct_layout(ctx, &llvm_fields);
+    if natural_size != total_size {
+        return Err(anyhow::anyhow!(
+            "enum slot map: `{}` lowered to {} bytes but rustc says {}",
+            name,
+            natural_size,
+            total_size
+        ));
+    }
+    debug_assert!(
+        natural_align <= abi_align.max(1),
+        "enum slot map: `{name}` natural align {natural_align} exceeds rustc's {abi_align}"
+    );
+
+    let field_slots = claim_of_field
+        .into_iter()
+        .map(|c| c.map(|ci| slot_of_claim[ci]))
+        .collect();
+    Ok(EnumSlotMap {
+        llvm_struct_ty: llvm_types::StructType::get_unnamed(ctx, llvm_fields).into(),
+        tag_slot: slot_of_claim[tag_claim],
+        field_slots,
+        field_offsets: all_field_offsets,
+        field_llvm_types,
+    })
 }
 
-/// Detect Direct-tag enums whose concatenated `{tag, fields...}` model cannot
-/// match rustc's memory layout: the structural size exceeds rustc's total
-/// size because several variants carry payloads that overlap in Rust but are
-/// concatenated in our model. Such an enum cannot be padded into shape, and
-/// traversing memory with it (GEP stride, load/store width) would silently
-/// read or write the wrong bytes, so callers reject it loudly instead.
+/// Convert a `MirEnumType` to its LLVM struct representation.
 ///
-/// Returns `Some(enum_name)` for a divergent enum, `None` when `ty` is not a
-/// `MirEnumType` or its layout is memory-faithful (possibly after padding).
-pub(crate) fn enum_memory_divergence(
+/// Thin wrapper over [`build_enum_slot_map`], which explains the layout.
+/// Any op that needs an index into the converted enum must take it from
+/// the slot map, never compute it by hand.
+pub(crate) fn convert_enum_to_llvm(
     ctx: &mut Context,
     ty: Ptr<TypeObj>,
-) -> Result<Option<String>, anyhow::Error> {
-    let info = {
-        let ty_ref = ty.deref(ctx);
-        ty_ref.downcast_ref::<MirEnumType>().map(|enum_ty| {
-            (
-                enum_ty.name().to_string(),
-                enum_ty.discriminant_ty,
-                enum_ty.all_field_types.clone(),
-                enum_ty.total_size(),
-            )
-        })
-    };
-    let Some((name, discriminant_ty, all_field_types, total_size)) = info else {
-        return Ok(None);
-    };
-    if total_size == 0 {
-        // Size unknown (niched / single-variant model): the un-niched model
-        // is deliberately self-consistent; nothing to check against.
-        return Ok(None);
-    }
-
-    let llvm_discr_ty = convert_type(ctx, discriminant_ty)?;
-    let mut llvm_fields = vec![llvm_discr_ty];
-    for field_ty in all_field_types {
-        llvm_fields.push(convert_type(ctx, field_ty)?);
-    }
-    let (_end, size, _align) = natural_struct_layout(ctx, &llvm_fields);
-
-    Ok((size > total_size).then_some(name))
+) -> Result<Ptr<TypeObj>, anyhow::Error> {
+    Ok(build_enum_slot_map(ctx, ty)?.llvm_struct_ty)
 }
 
-/// Find a layout-divergent enum reachable from `ty` through the kernel ABI.
+/// Is this an enum whose device bytes do NOT match the host's?
 ///
-/// Walks the pre-conversion MIR type tree: pointer pointees, slice and
-/// array elements, struct/tuple fields, and enum payload fields. Returns
-/// the first divergent enum's name (see [`enum_memory_divergence`]), or
-/// `None` when the whole tree is memory-faithful.
+/// Most enums now lower byte-identically to rustc's layout and pass any
+/// boundary freely. The exception is enums whose layout we deliberately
+/// did not record (`total_size == 0`):
 ///
-/// Used only for KERNEL signatures: a kernel parameter is laid out by the
-/// host with rustc's real layout (by value via `cuLaunchKernel`, or behind
-/// pointers/slices into `DeviceBuffer` memory), so a divergent enum there
-/// means host and device disagree on stride and field offsets. Device-local
-/// use of the same enum (locals, construct, match, loads/stores of allocas)
-/// is self-consistent because every access uses the same lowered struct
-/// type, and is deliberately NOT rejected.
+/// - Niche-encoded enums like `Option<&T>`. On the host, Rust stores no
+///   tag at all; it reuses an impossible payload value (null, for a
+///   never-null `&T`) to mean `None`. On the device we give such enums
+///   an explicit tag instead, which the host bytes simply do not have.
+/// - Multi-variant enums rustc reports as having a single live variant
+///   (e.g. `Result<T, Infallible>`): same story, the device tag has no
+///   host counterpart.
+///
+/// WHY the device differs at all: nothing in the hardware demands it.
+/// With a real tag, "which variant?" is a one-field load and
+/// "construct" is a one-field store, which is all our discriminant and
+/// construct ops know how to be. With a niche there is no tag to load:
+/// the discriminant must be COMPUTED from the payload (null check,
+/// byte-range check, in general rustc's get_discr range arithmetic),
+/// and constructing `None` means writing a magic payload value. That
+/// per-enum decode/encode logic has not been ported yet, so the device
+/// keeps a synthetic tag, which is fine while the bytes stay on the
+/// device and a lie the moment they meet host memory. Porting the
+/// niche logic is the follow-up that would erase this difference and
+/// retire this check.
+///
+/// One-variant enums with `total_size == 0` are fine: there is nothing
+/// for the two sides to disagree about.
+///
+/// Returns the enum's name when its bytes are unmodeled, else `None`.
+pub(crate) fn enum_unmodeled_in_memory(ctx: &Context, ty: Ptr<TypeObj>) -> Option<String> {
+    let ty_ref = ty.deref(ctx);
+    let enum_ty = ty_ref.downcast_ref::<MirEnumType>()?;
+    (enum_ty.total_size() == 0 && enum_ty.variant_count() > 1).then(|| enum_ty.name().to_string())
+}
+
+/// Search a kernel parameter's type for an enum the host and device
+/// would disagree about (see [`enum_unmodeled_in_memory`]).
+///
+/// The search looks everywhere host data can hide: behind pointers,
+/// inside slices and arrays, in struct/tuple fields, and in other enums'
+/// payloads. It returns the first offending enum's name.
+///
+/// Only kernel signatures are checked. A kernel parameter is host data
+/// (passed by value at launch, or reachable through a `DeviceBuffer`
+/// pointer), so its bytes must mean the same thing on both sides. The
+/// same enum used purely INSIDE a kernel (locals, construct, match) is
+/// fine and is deliberately not rejected: there, both reader and writer
+/// are the device, using one consistent layout.
 ///
 /// `visited` breaks cycles through recursive types (`Ptr<TypeObj>` is
 /// interned, so equality is identity).
-pub(crate) fn find_divergent_enum_in_abi(
+pub(crate) fn find_unmodeled_enum_in_abi(
     ctx: &mut Context,
     ty: Ptr<TypeObj>,
     visited: &mut Vec<Ptr<TypeObj>>,
@@ -772,7 +967,7 @@ pub(crate) fn find_divergent_enum_in_abi(
     }
     visited.push(ty);
 
-    if let Some(name) = enum_memory_divergence(ctx, ty)? {
+    if let Some(name) = enum_unmodeled_in_memory(ctx, ty) {
         return Ok(Some(name));
     }
 
@@ -798,7 +993,7 @@ pub(crate) fn find_divergent_enum_in_abi(
     };
 
     for child in children {
-        if let Some(name) = find_divergent_enum_in_abi(ctx, child, visited)? {
+        if let Some(name) = find_unmodeled_enum_in_abi(ctx, child, visited)? {
             return Ok(Some(name));
         }
     }

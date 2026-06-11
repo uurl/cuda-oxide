@@ -5703,57 +5703,10 @@ fn enum_variant_index_from_bytes(
     }
 }
 
-/// Return the byte offsets for the fields of one active enum variant.
-fn enum_variant_field_offsets(
-    layout: &rustc_public::abi::LayoutShape,
-    variant_index: usize,
-    loc: Location,
-) -> TranslationResult<Vec<usize>> {
-    match &layout.variants {
-        rustc_public::abi::VariantsShape::Single { index } => {
-            if index.to_index() != variant_index {
-                return input_err!(
-                    loc,
-                    TranslationErr::unsupported(format!(
-                        "Enum layout single-variant index {} disagrees with requested variant {}",
-                        index.to_index(),
-                        variant_index
-                    ))
-                );
-            }
-
-            match &layout.fields {
-                rustc_public::abi::FieldsShape::Primitive => Ok(vec![]),
-                rustc_public::abi::FieldsShape::Arbitrary { offsets } => {
-                    Ok(offsets.iter().map(|offset| offset.bytes()).collect())
-                }
-                other => input_err!(
-                    loc,
-                    TranslationErr::unsupported(format!(
-                        "Single-variant enum fields use unsupported shape {:?}",
-                        other
-                    ))
-                ),
-            }
-        }
-        rustc_public::abi::VariantsShape::Multiple { variants, .. } => variants
-            .get(variant_index)
-            .map(|variant| {
-                variant
-                    .offsets
-                    .iter()
-                    .map(|offset| offset.bytes())
-                    .collect()
-            })
-            .ok_or_else(|| {
-                input_error_noloc!(TranslationErr::unsupported(format!(
-                    "Missing layout info for enum variant {}",
-                    variant_index
-                )))
-            }),
-        rustc_public::abi::VariantsShape::Empty => Ok(vec![]),
-    }
-}
+// Byte-offset lookups over rustc enum layout live in the shared
+// `translator::layout` module so type import and constant decoding cannot
+// drift on how an offset is derived.
+use crate::translator::layout::{enum_tag_offset, enum_variant_field_offsets};
 
 /// Read an enum tag scalar from raw bytes using the stable layout metadata.
 fn read_enum_tag_value(
@@ -5771,40 +5724,7 @@ fn read_enum_tag_value(
         .size(&rustc_public::target::MachineInfo::target())
         .bytes();
 
-    let offset = match fields {
-        rustc_public::abi::FieldsShape::Primitive => {
-            if tag_field == 0 {
-                0
-            } else {
-                return input_err!(
-                    loc,
-                    TranslationErr::unsupported(format!(
-                        "Enum tag field {} out of bounds for primitive layout",
-                        tag_field
-                    ))
-                );
-            }
-        }
-        rustc_public::abi::FieldsShape::Arbitrary { offsets } => offsets
-            .get(tag_field)
-            .map(|offset| offset.bytes())
-            .ok_or_else(|| {
-                input_error_noloc!(TranslationErr::unsupported(format!(
-                    "Enum tag field {} out of bounds for {} layout fields",
-                    tag_field,
-                    offsets.len()
-                )))
-            })?,
-        other => {
-            return input_err!(
-                loc,
-                TranslationErr::unsupported(format!(
-                    "Enum tag extraction does not support field shape {:?}",
-                    other
-                ))
-            );
-        }
-    };
+    let offset = enum_tag_offset(fields, tag_field, loc.clone())?;
 
     let end = offset.checked_add(byte_size).ok_or_else(|| {
         input_error_noloc!(TranslationErr::unsupported(format!(

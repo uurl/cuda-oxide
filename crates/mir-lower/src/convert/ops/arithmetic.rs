@@ -718,7 +718,12 @@ pub(crate) fn convert_three_way_cmp(
     rewriter.insert_operation(ctx, undef.get_operation());
     let enum_value = undef.get_operation().deref(ctx).get_result(0);
 
-    let insert_discr = llvm::InsertValueOp::new(ctx, enum_value, selected_discr, vec![0]);
+    // The tag slot comes from the enum slot map (for Ordering it is slot
+    // 0, but the index source must be the map, never a literal).
+    let tag_slot = crate::convert::types::build_enum_slot_map(ctx, mir_result_ty)
+        .map_err(|e| pliron::input_error!(loc.clone(), "{e}"))?
+        .tag_slot;
+    let insert_discr = llvm::InsertValueOp::new(ctx, enum_value, selected_discr, vec![tag_slot]);
     rewriter.insert_operation(ctx, insert_discr.get_operation());
     rewriter.replace_operation(ctx, op, insert_discr.get_operation());
     Ok(())

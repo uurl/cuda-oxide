@@ -68,7 +68,10 @@ use crate::helpers;
 use dialect_mir::ops::{MirCallOp, MirFuncOp};
 use dialect_mir::rust_intrinsics;
 use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType, MirTupleType};
-use llvm_export::op_interfaces::CastOpInterface;
+use llvm_export::attributes::IntegerOverflowFlagsAttr;
+use llvm_export::op_interfaces::{
+    BinArithOp, CastOpInterface, CastOpWithNNegInterface, IntBinArithOpWithOverflowFlag,
+};
 use llvm_export::ops as llvm;
 use llvm_export::types as llvm_types;
 use llvm_export::types::PointerTypeExt;
@@ -143,6 +146,24 @@ impl RustSaturatingIntrinsic {
         match callee {
             rust_intrinsics::CALLEE_SATURATING_ADD => Some(Self::Add),
             rust_intrinsics::CALLEE_SATURATING_SUB => Some(Self::Sub),
+            _ => None,
+        }
+    }
+}
+
+/// Internal placeholder for rustc bigint helper intrinsics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RustBigIntIntrinsic {
+    /// `core::intrinsics::carrying_mul_add`: double-width
+    /// multiply-accumulate returning a `(low, high)` pair.
+    CarryingMulAdd,
+}
+
+impl RustBigIntIntrinsic {
+    /// Convert an importer placeholder name back into the intrinsic it represents.
+    fn from_placeholder_callee(callee: &str) -> Option<Self> {
+        match callee {
+            rust_intrinsics::CALLEE_CARRYING_MUL_ADD => Some(Self::CarryingMulAdd),
             _ => None,
         }
     }
@@ -381,6 +402,12 @@ pub fn convert(
 
     if let Some(intrinsic) = RustSaturatingIntrinsic::from_placeholder_callee(&callee_name) {
         return convert_rust_saturating_intrinsic(ctx, rewriter, op, operands_info, intrinsic);
+    }
+
+    if let Some(RustBigIntIntrinsic::CarryingMulAdd) =
+        RustBigIntIntrinsic::from_placeholder_callee(&callee_name)
+    {
+        return convert_rust_carrying_mul_add(ctx, rewriter, op, operands_info);
     }
 
     if let Some(intrinsic) = RustFloatMathIntrinsic::from_placeholder_callee(&callee_name) {
@@ -663,6 +690,152 @@ fn convert_rust_saturating_intrinsic(
     let replacement = final_op.unwrap_or_else(|| llvm_call.get_operation());
     rewriter.replace_operation(ctx, op, replacement);
 
+    Ok(())
+}
+
+/// Lower the placeholder call for rustc's `carrying_mul_add` bigint intrinsic.
+///
+/// `core::intrinsics::carrying_mul_add(a, b, c, d)` computes `a * b + c + d`
+/// without losing any bits and returns the exact result split into a
+/// `(low_half, high_half)` tuple. The integer methods `carrying_mul_add`,
+/// `carrying_mul`, and `widening_mul` all funnel into this one intrinsic.
+/// An N-bit multiply-accumulate always fits in 2*N bits:
+/// even for the largest unsigned inputs,
+/// `(2^N - 1)^2 + 2 * (2^N - 1) == 2^(2N) - 1`.
+///
+/// The lowering widens all four operands to 2*N bits (zero-extending for
+/// unsigned types, sign-extending for signed types, matching the `as` casts
+/// in core's fallback implementation), computes the product-sum in 2*N-bit
+/// arithmetic, and splits the wide value:
+///
+/// ```text
+/// wide = ext(a) * ext(b) + ext(c) + ext(d)  : i2N
+/// low  = trunc(wide)                        : iN
+/// high = trunc(wide >> N)                   : iN
+/// result = { low, high }
+/// ```
+///
+/// A logical shift (`lshr`) is used for the high half even for signed types:
+/// core's fallback uses an arithmetic shift there, but the shifted value is
+/// immediately truncated to N bits, and bits [N, 2N) of the wide value are
+/// identical under either shift. The NVPTX backend pattern-matches this
+/// ext/mul/shift idiom into `mul.lo` / `mul.hi` / `mad` instructions, so the
+/// generated PTX is good.
+///
+/// 128-bit integers are rejected with a diagnostic: their lowering would
+/// need 256-bit intermediate arithmetic, which NVPTX cannot legalize.
+fn convert_rust_carrying_mul_add(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let loc = op.deref(ctx).loc();
+    if op.deref(ctx).get_num_results() != 1 {
+        return pliron::input_err!(loc, "Rust carrying_mul_add intrinsic must have one result");
+    }
+
+    let args: Vec<Value> = op.deref(ctx).operands().collect();
+    if args.len() != 4 {
+        return pliron::input_err!(
+            loc,
+            "Rust carrying_mul_add intrinsic requires four operands \
+             (multiplier, multiplicand, addend, carry)"
+        );
+    }
+
+    let elem_ty = args[0].get_type(ctx);
+    let width = integer_bit_width(ctx, elem_ty, loc.clone())?;
+    if width > 64 {
+        return pliron::input_err!(
+            loc,
+            "carrying_mul_add on {width}-bit integers is not yet supported on the device: \
+             the lowering needs {}-bit intermediate arithmetic, which NVPTX cannot legalize",
+            width * 2
+        );
+    }
+
+    // Rust preserves signedness in the original MIR type; the converted LLVM
+    // value is signless, so recover it from the pre-conversion operand type.
+    let is_signed = if let Some(int_ty) =
+        operands_info.lookup_most_recent_of_type::<IntegerType>(ctx, args[0])
+    {
+        int_ty.signedness() == Signedness::Signed
+    } else {
+        return pliron::input_err!(
+            loc,
+            "expected integer type for Rust carrying_mul_add intrinsic"
+        );
+    };
+
+    let wide_ty: Ptr<TypeObj> = IntegerType::get(ctx, width * 2, Signedness::Signless).into();
+
+    // Widen every operand to 2*N bits with the signedness-appropriate extension.
+    let mut wide_args = Vec::with_capacity(4);
+    for &arg in &args {
+        let ext_op = if is_signed {
+            llvm::SExtOp::new(ctx, arg, wide_ty).get_operation()
+        } else {
+            // `nneg` is a poison-introducing optimization flag ("the operand
+            // is known non-negative"); we assert nothing and leave it unset.
+            llvm::ZExtOp::new_with_nneg(ctx, arg, wide_ty, false).get_operation()
+        };
+        rewriter.insert_operation(ctx, ext_op);
+        wide_args.push(ext_op.deref(ctx).get_result(0));
+    }
+
+    // wide = a * b + c + d, computed in 2*N bits (cannot overflow).
+    let flags = IntegerOverflowFlagsAttr::default();
+    let mul = llvm::MulOp::new_with_overflow_flag(ctx, wide_args[0], wide_args[1], flags.clone())
+        .get_operation();
+    rewriter.insert_operation(ctx, mul);
+    let product = mul.deref(ctx).get_result(0);
+    let add_c = llvm::AddOp::new_with_overflow_flag(ctx, product, wide_args[2], flags.clone())
+        .get_operation();
+    rewriter.insert_operation(ctx, add_c);
+    let sum_c = add_c.deref(ctx).get_result(0);
+    let add_d =
+        llvm::AddOp::new_with_overflow_flag(ctx, sum_c, wide_args[3], flags).get_operation();
+    rewriter.insert_operation(ctx, add_d);
+    let wide = add_d.deref(ctx).get_result(0);
+
+    // low = trunc(wide); high = trunc(wide >> N).
+    let low_op = llvm::TruncOp::new(ctx, wide, elem_ty).get_operation();
+    rewriter.insert_operation(ctx, low_op);
+    let low = low_op.deref(ctx).get_result(0);
+
+    let shift_amount = {
+        let wide_width = NonZeroUsize::new((width * 2) as usize).expect("width is non-zero");
+        let attr = IntegerAttr::new(
+            IntegerType::get(ctx, width * 2, Signedness::Signless),
+            APInt::from_u64(u64::from(width), wide_width),
+        );
+        let const_op = llvm::ConstantOp::new(ctx, attr.into());
+        rewriter.insert_operation(ctx, const_op.get_operation());
+        const_op.get_operation().deref(ctx).get_result(0)
+    };
+    let shr = llvm::LShrOp::new(ctx, wide, shift_amount).get_operation();
+    rewriter.insert_operation(ctx, shr);
+    let shifted = shr.deref(ctx).get_result(0);
+    let high_op = llvm::TruncOp::new(ctx, shifted, elem_ty).get_operation();
+    rewriter.insert_operation(ctx, high_op);
+    let high = high_op.deref(ctx).get_result(0);
+
+    // Pack the (low, high) tuple into the converted result struct.
+    let result_mir_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    let result_ty = convert_type(ctx, result_mir_ty).map_err(anyhow_to_pliron)?;
+    let undef = llvm::UndefOp::new(ctx, result_ty);
+    rewriter.insert_operation(ctx, undef.get_operation());
+    let struct_val = undef.get_operation().deref(ctx).get_result(0);
+
+    let insert_low = llvm::InsertValueOp::new(ctx, struct_val, low, vec![0]);
+    rewriter.insert_operation(ctx, insert_low.get_operation());
+    let struct_with_low = insert_low.get_operation().deref(ctx).get_result(0);
+
+    let insert_high = llvm::InsertValueOp::new(ctx, struct_with_low, high, vec![1]);
+    rewriter.insert_operation(ctx, insert_high.get_operation());
+
+    rewriter.replace_operation(ctx, op, insert_high.get_operation());
     Ok(())
 }
 

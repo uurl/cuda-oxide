@@ -1077,6 +1077,25 @@ fn translate_call(
         return Ok(op);
     }
 
+    // A call to a rustc intrinsic that no dispatch arm above recognized can
+    // never be emitted as a regular function call: rustc resolves intrinsics
+    // to `InstanceKind::Intrinsic`, the collector skips those by design, so
+    // no definition for the symbol will ever exist in the module. Emitting
+    // the call anyway would only fail much later, as a confusing
+    // "Symbol ... not found" verifier error on the LLVM dialect module.
+    // Fail here instead, with the intrinsic's name and source location, so
+    // each gap surfaces as an actionable per-site diagnostic (issue #137).
+    if let Some(ref name) = pattern_name
+        && (name.starts_with("core::intrinsics::") || name.starts_with("std::intrinsics::"))
+    {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "rustc intrinsic `{name}` is not yet supported on the device"
+            ))
+        );
+    }
+
     // Not an intrinsic - emit regular function call
     let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
     let legal_name = legaliser.legalise(&raw_name);
@@ -1538,6 +1557,22 @@ fn try_dispatch_intrinsic(
                 loc,
             )?,
         ));
+    }
+
+    if let Some(intrinsic) = intrinsics::bigint::RustBigIntIntrinsic::from_core_path(name) {
+        return Ok(Some(intrinsics::bigint::emit_rust_bigint_intrinsic(
+            ctx,
+            body,
+            intrinsic,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
     }
 
     if let Some(intrinsic) = intrinsics::float_math::RustFloatMathIntrinsic::from_core_path(name) {

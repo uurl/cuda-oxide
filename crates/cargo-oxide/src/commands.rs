@@ -385,7 +385,7 @@ fn build_interop_device_crate(
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    let ptx_path = ptx_dir.join(format!("{}.ptx", artifact_name));
+    let ptx_path = ptx_dir.join(format!("{}.ptx", artifact_stem(&artifact_name)));
     if !ptx_path.exists() {
         eprintln!(
             "Error: device crate build succeeded but did not produce {}",
@@ -1468,11 +1468,21 @@ fn touch_main_rs(example_dir: &Path) {
     }
 }
 
+/// Artifacts are named after the crate, and cargo normalizes hyphens in
+/// package names to underscores (`rustlantis-smoke` emits
+/// `rustlantis_smoke.ptx`). Always go through this when deriving an
+/// artifact filename from an example name, or hyphenated examples keep
+/// stale artifacts forever.
+fn artifact_stem(example: &str) -> String {
+    example.replace('-', "_")
+}
+
 /// Remove stale generated artifacts (`.ptx`, `.ll`, `.ltoir`, `.cubin`) from a
 /// previous run so we can verify the build produces fresh output.
 fn clean_generated_files(example_dir: &Path, example: &str) {
-    for ext in &["ptx", "ll", "ltoir", "cubin"] {
-        let file = example_dir.join(format!("{}.{}", example, ext));
+    let stem = artifact_stem(example);
+    for ext in &["ptx", "ll", "opt.ll", "ltoir", "cubin"] {
+        let file = example_dir.join(format!("{}.{}", stem, ext));
         if file.exists() {
             let _ = std::fs::remove_file(&file);
         }
@@ -1486,13 +1496,14 @@ fn format_label(emit_nvvm_ir: bool) -> &'static str {
 
 /// Print generated artifacts (LLVM IR or PTX) to stdout after a pipeline build.
 fn show_generated_artifacts(example_dir: &Path, example: &str) {
-    let ll_file = example_dir.join(format!("{}.ll", example));
-    let ptx_file = example_dir.join(format!("{}.ptx", example));
+    let stem = artifact_stem(example);
+    let ll_file = example_dir.join(format!("{}.ll", stem));
+    let ptx_file = example_dir.join(format!("{}.ptx", stem));
 
     if ll_file.exists() {
         println!();
         println!("=========================================");
-        println!("LLVM IR ({}.ll)", example);
+        println!("LLVM IR ({}.ll)", stem);
         println!("=========================================");
         if let Ok(content) = std::fs::read_to_string(&ll_file) {
             println!("{}", content);
@@ -1502,7 +1513,7 @@ fn show_generated_artifacts(example_dir: &Path, example: &str) {
     if ptx_file.exists() {
         println!();
         println!("=========================================");
-        println!("PTX ({}.ptx)", example);
+        println!("PTX ({}.ptx)", stem);
         println!("=========================================");
         if let Ok(content) = std::fs::read_to_string(&ptx_file) {
             println!("{}", content);
@@ -1760,6 +1771,12 @@ mod tests {
         cmd.get_envs()
             .find(|(name, _)| *name == OsStr::new(key))
             .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn artifact_stem_normalizes_hyphens_like_cargo() {
+        assert_eq!(artifact_stem("rustlantis-smoke"), "rustlantis_smoke");
+        assert_eq!(artifact_stem("vecadd"), "vecadd");
     }
 
     #[test]

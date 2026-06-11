@@ -1221,7 +1221,7 @@ mod tests {
             let kernel_attr = StringAttr::new("true".to_string());
             let key: pliron::identifier::Identifier = "gpu_kernel".try_into().unwrap();
             func_op
-                .deref_mut(&mut ctx)
+                .deref_mut(&ctx)
                 .attributes
                 .0
                 .insert(key, kernel_attr.into());

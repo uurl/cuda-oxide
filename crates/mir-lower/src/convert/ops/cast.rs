@@ -342,11 +342,31 @@ fn emit_unsize_cast(
     let array_len = {
         let mir_ref = mir_opd_ty.deref(ctx);
         mir_ref.downcast_ref::<MirPtrType>().and_then(|ptr_ty| {
-            ptr_ty
-                .pointee
-                .deref(ctx)
-                .downcast_ref::<MirArrayType>()
-                .map(|arr| arr.size())
+            let pointee_ref = ptr_ty.pointee.deref(ctx);
+            if let Some(arr) = pointee_ref.downcast_ref::<MirArrayType>() {
+                // `&[T; N] -> &[T]`: the classic array unsize.
+                Some(arr.size())
+            } else if let Some(struct_ty) =
+                pointee_ref.downcast_ref::<dialect_mir::types::MirStructType>()
+            {
+                // `&S<[T; N]> -> &S<[T]>` where the struct's LAST field is
+                // the array that becomes the unsized tail (e.g. the
+                // `PolymorphicIter` inside `core::array::IntoIter`, which
+                // every `for x in arr` loop unsizes; issue #138). The fat
+                // pointer's metadata is that array's element count.
+                let field_types = struct_ty.field_types();
+                let last_decl_idx = match struct_ty.memory_order().last().copied() {
+                    Some(idx) => idx,
+                    None => field_types.len().checked_sub(1)?,
+                };
+                field_types.get(last_decl_idx).and_then(|t| {
+                    t.deref(ctx)
+                        .downcast_ref::<MirArrayType>()
+                        .map(|a| a.size())
+                })
+            } else {
+                None
+            }
         })
     };
 

@@ -54,6 +54,7 @@
 //!   - `tma`: Tensor memory access
 //!   - `memory`: SharedArray indexing, stmatrix
 
+mod drop_glue;
 pub mod helpers;
 pub mod intrinsics;
 
@@ -743,24 +744,39 @@ fn translate_switch(
 ///
 /// rustc emits `TerminatorKind::Drop` only for places whose type has drop
 /// glue. cuda-oxide does not yet emit device-side `drop_in_place` calls,
-/// so any drop-glued type reaching codegen would have its destructor
-/// silently skipped. Rather than lower to a goto and produce a silent
-/// miscompile, we surface a hard error with the dropped place's type so
-/// the user can diagnose and restructure the kernel.
+/// so a destructor that actually does something cannot run on the device.
+///
+/// Two cases:
+///
+/// 1. **Provably no-op glue**: when the monomorphized drop glue does
+///    nothing observable (checked by [`drop_glue::drop_glue_is_noop`]),
+///    the terminator lowers to a plain branch to its target block.
+///    The common source pattern is `for x in arr` over a by-value
+///    array: the loop's `core::array::IntoIter<T, N>` has an
+///    `impl Drop`, but for element types without drop glue that
+///    destructor folds to nothing.
+///
+/// 2. **Genuinely effectful glue**: we surface a hard error with the
+///    dropped place's type so the user can diagnose and restructure
+///    the kernel. Lowering to a goto here would silently skip the
+///    destructor and miscompile.
 ///
 /// Suppressing drop glue on a Copy-shaped value (e.g. wrapping in
 /// `core::mem::ManuallyDrop`) prevents the Drop terminator from being
 /// emitted in the first place and lets the kernel compile.
+///
+/// The unwind action is ignored: device code is panic=abort, and for the
+/// no-op case there is nothing that could unwind anyway.
 #[allow(clippy::too_many_arguments)]
 fn translate_drop(
-    _ctx: &mut Context,
+    ctx: &mut Context,
     body: &mir::Body,
     place: &mir::Place,
-    _target: mir::BasicBlockIdx,
+    target: mir::BasicBlockIdx,
     _unwind: &mir::UnwindAction,
-    _block_ptr: Ptr<BasicBlock>,
-    _prev_op: Option<Ptr<Operation>>,
-    _block_map: &[Ptr<BasicBlock>],
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
     let dropped_ty = place.ty(body.locals()).map_err(|e| {
@@ -771,12 +787,16 @@ fn translate_drop(
             ))
         )
     })?;
+    if drop_glue::drop_glue_is_noop(dropped_ty) {
+        return translate_goto(ctx, target, block_ptr, prev_op, block_map, loc);
+    }
     input_err!(
         loc,
         TranslationErr::unsupported(format!(
-            "drop of `{:?}` is not supported on the device; cuda-oxide does \
-             not yet emit device-side `drop_in_place` calls. Restructure the \
-             kernel to use only `Copy` types, or wrap the value in \
+            "drop of `{:?}` is not supported on the device; its destructor \
+             does observable work and cuda-oxide does not yet emit \
+             device-side `drop_in_place` calls. Restructure the kernel to \
+             use only `Copy` types, or wrap the value in \
              `core::mem::ManuallyDrop` to suppress drop glue.",
             dropped_ty.kind()
         ))
@@ -1022,6 +1042,61 @@ fn translate_call(
             body,
             func,
             args,
+            destination,
+            &target_usize,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+            name,
+        );
+    }
+
+    // `assert_inhabited::<T>()` is a compile-time validity check that rustc
+    // plants in `MaybeUninit::assume_init_read`, which the `for x in arr`
+    // loop machinery calls for every yielded element (issue #138). The
+    // intrinsic panics only when `T` has no possible values at all (an
+    // "uninhabited" type such as `core::convert::Infallible`); for any
+    // ordinary type it compiles to nothing. We decide which case applies
+    // from the monomorphized type's layout: uninhabited types are exactly
+    // those whose layout has `VariantsShape::Empty`. Inhabited types lower
+    // to a unit no-op; uninhabited ones lower to `unreachable`, matching
+    // how device code models panics (they cannot execute on the GPU).
+    // If the generic argument or its layout cannot be read, fall through
+    // to the loud "not yet supported" rejection below.
+    if let Some(ref name) = pattern_name
+        && (name == "core::intrinsics::assert_inhabited"
+            || name == "std::intrinsics::assert_inhabited")
+        && let mir::Operand::Constant(const_op) = func
+        && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(_, substs)) =
+            const_op.const_.ty().kind()
+        && let Some(rustc_public::ty::GenericArgKind::Type(checked_ty)) = substs.0.first()
+        && let Ok(layout) = checked_ty.layout()
+    {
+        let uninhabited = matches!(
+            layout.shape().variants,
+            rustc_public::abi::VariantsShape::Empty
+        );
+        if uninhabited {
+            let op = Operation::new(
+                ctx,
+                dialect_mir::ops::MirUnreachableOp::get_concrete_op_info(),
+                vec![],
+                vec![],
+                vec![],
+                0,
+            );
+            op.deref_mut(ctx).set_loc(loc);
+            if let Some(prev) = prev_op {
+                op.insert_after(ctx, prev);
+            } else {
+                op.insert_at_front(block_ptr, ctx);
+            }
+            return Ok(op);
+        }
+        return helpers::emit_unit_noop_intrinsic(
+            ctx,
             destination,
             &target_usize,
             block_ptr,

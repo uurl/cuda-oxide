@@ -147,6 +147,45 @@ pub fn is_rust_type_zst(rust_ty: &rustc_public::ty::Ty) -> bool {
     }
 }
 
+/// If `ty` is a struct made unsized by a trailing slice field, return that
+/// slice's ELEMENT type. Returns `None` for every other type.
+///
+/// Rust allows the LAST field of a struct to be an unsized type such as
+/// `[T]`; the struct itself then becomes unsized and a reference to it is
+/// a fat pointer: (pointer to the struct's first byte, number of trailing
+/// elements). The motivating case is `core::array::iter::iter_inner::
+/// PolymorphicIter<[MaybeUninit<T>]>`, the type that backs
+/// `core::array::IntoIter` and therefore every `for x in arr` loop over a
+/// by-value array (issue #138).
+///
+/// The check recurses through nested structs because the unsized tail may
+/// itself sit at the end of an inner struct (`struct A { b: B }` with
+/// `struct B { t: [u32] }` makes `A` slice-tailed too).
+pub(super) fn slice_tail_element_ty(ty: &rustc_public::ty::Ty) -> Option<rustc_public::ty::Ty> {
+    match ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(adt_def, substs)) => {
+            let variants = adt_def.variants();
+            // Only structs (exactly one variant) can have an unsized tail.
+            if variants.len() != 1 {
+                return None;
+            }
+            let fields = variants[0].fields();
+            let last_field = fields.last()?;
+            let last_ty = last_field.ty_with_args(&substs);
+            match last_ty.kind() {
+                rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Slice(elem)) => {
+                    Some(elem)
+                }
+                rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(..)) => {
+                    slice_tail_element_ty(&last_ty)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Translates a raw-pointer or reference type to its `dialect-mir` equivalent.
 ///
 /// Most pointers become generic-addrspace `MirPtrType`, but a few Rust-level
@@ -206,6 +245,26 @@ fn translate_pointer_like(
             )
             .into();
             Ok(dialect_mir::types::MirPtrType::get_shared(ctx, u64_ty, is_mutable).into())
+        }
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(..))
+            if slice_tail_element_ty(pointee).is_some() =>
+        {
+            // A reference to a struct whose last field is a slice (an
+            // "unsized tail"), e.g. the `PolymorphicIter<[MaybeUninit<T>]>`
+            // backing every `for x in arr` loop. Such a reference is a FAT
+            // pointer at runtime: (pointer to the struct, number of tail
+            // elements). Modelling it as a thin pointer would silently drop
+            // the element count, which feeds slice reborrows of the tail.
+            //
+            // We reuse `MirSliceType` as the fat-pair carrier with the
+            // translated STRUCT as its element type, so the existing
+            // fat-pointer machinery (function-boundary flattening into
+            // (ptr, len), `PtrMetadata` extraction, fat-value copies) all
+            // applies unchanged. Field access through the fat pointer
+            // extracts the data pointer (the struct's address) first; see
+            // the place-address walker in `rvalue.rs`.
+            let struct_model = translate_type(ctx, pointee)?;
+            Ok(MirSliceType::get(ctx, struct_model).into())
         }
         _ => {
             let pointee_ty = translate_type(ctx, pointee)?;
@@ -520,7 +579,25 @@ pub fn translate_type(
 
                         // Get field type, instantiated with the ADT's generic args
                         let field_ty = field.ty_with_args(&substs);
-                        let translated_ty = translate_type(ctx, &field_ty)?;
+                        let translated_ty = if let rustc_public::ty::TyKind::RigidTy(
+                            rustc_public::ty::RigidTy::Slice(elem_ty),
+                        ) = field_ty.kind()
+                        {
+                            // A slice-typed field can only be the struct's
+                            // unsized tail (Rust allows `[T]` only as the
+                            // last field). The tail's elements live INLINE
+                            // after the sized prefix, so we record the
+                            // ELEMENT type here: the field's address (from
+                            // rustc's layout offset) is then a pointer to
+                            // the first element, which is exactly what a
+                            // reborrow of the tail needs. Recording the
+                            // generic `[T]` fat-pair type instead would make
+                            // field addressing produce a pointer to a
+                            // (ptr, len) pair that does not exist in memory.
+                            translate_type(ctx, &elem_ty)?
+                        } else {
+                            translate_type(ctx, &field_ty)?
+                        };
                         field_types.push(translated_ty);
                     }
 

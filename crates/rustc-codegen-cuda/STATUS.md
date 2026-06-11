@@ -15,6 +15,11 @@ Run `scripts/check-error-example-status.sh` to verify both are in sync.
 | :------------------------------------ | :------------------ | :---------------------------------- |
 | `error`                               | diagnostics-fixture | `core::fmt` reachable from device   |
 | `error_copy_nonoverlapping_unhandled` | support-gap         | `StatementKind::CopyNonOverlapping` |
-| `error_drop_glue`                     | support-gap         | `TerminatorKind::Drop`              |
+| `error_drop_glue`                     | support-gap         | `TerminatorKind::Drop` (effectful)  |
 | `error_set_discriminant_unhandled`    | support-gap         | `StatementKind::SetDiscriminant`    |
 | `error_wgmma_mma_unimplemented`       | support-gap         | WGMMA MMA lowering                  |
+
+`error_drop_glue` only fails for destructors that do observable work.
+Drops whose monomorphized glue is provably a no-op (e.g. the
+`core::array::IntoIter` behind `for x in arr` with Copy elements) lower
+to a plain branch since issue #138.

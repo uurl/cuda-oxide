@@ -99,8 +99,38 @@ let (a_dev, b_dev, c_dev) = tokio::spawn(op.into_future()).await??;
 
 The owned form keeps device buffers alive until the CUDA stream reaches the
 kernel completion callback, then returns those buffers as the operation output.
-If an owned future is dropped after submission but before completion, the
-runtime synchronizes the assigned stream before releasing those resources.
+
+## Cancellation and deferred reclamation
+
+Dropping a `DeviceFuture` never cancels GPU work. Once a kernel is submitted
+it runs to completion no matter what the host does; cancellation only decides
+*when the host releases* the resources the kernel is still using.
+
+Dropping an in-flight future records a CUDA event on its assigned stream and
+parks the stored result in a process-wide limbo. The drop itself never blocks
+on GPU progress.
+
+```text
+drop(future)                      later sweep (any poll or drop)
+  record event on stream            event passed?  -> drop the result
+  park (event, result)              still running? -> keep it parked
+```
+
+Parked results are swept opportunistically whenever any `DeviceFuture` is
+polled or dropped, and a result is only dropped once `cuEventQuery` proves
+the device timeline passed its event. `cuda_async::reclaim::drain()` performs
+a blocking drain when deterministic reclamation is needed (for example at the
+end of a test); entries still parked at process exit are leaked and reclaimed
+by the driver at teardown.
+
+The same deferred path covers the case where the kernel launch succeeds but
+host-callback registration fails: the owned resources are parked, not dropped,
+even though the future resolves with an error.
+
+Two failure endgames exist, both biased toward leaking rather than freeing
+memory the device may still write to: if the completion event cannot be
+recorded, the drop falls back to synchronizing the stream, and only when even
+that fails is the result deliberately leaked with a message on stderr.
 
 ## Buffer lifetime safety
 

@@ -34,6 +34,10 @@ mod kernels {
 
     /// `p` is the short-circuit bool phi; `q` is an independent bool.
     /// Encodes both comparisons in one lane: `(p == q) + 2 * (p < q)`.
+    // The bool `<` is the regression under test: it must reach mir-lower as a
+    // comparison on an untracked i1 phi and lower to `icmp ult i1`. Clippy's
+    // simplification (`!p & q`) would change the MIR shape and skip that path.
+    #[allow(clippy::bool_comparison)]
     #[kernel]
     pub fn bool_phi_cmp(a: &[u32], b: &[u32], mut out: DisjointSlice<u32>) {
         let idx = thread::index_1d();

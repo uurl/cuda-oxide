@@ -45,6 +45,8 @@
 //! | ptr → ptr (diff addrspace)                     | `addrspacecast`                             |
 //! | struct → integer, equal size                   | `alloca` + `store` + `load`                 |
 //! | struct → integer, mismatched size              | cuda-oxide error (see issue #21)            |
+//! | array ↔ anything, equal size                   | `alloca` + `store` + `load`                 |
+//! | array ↔ anything, mismatched size              | cuda-oxide error (see issue #125)           |
 //! | otherwise                                      | `bitcast`                                   |
 //!
 //! The niche path runs first because it is the only correct lowering when
@@ -70,6 +72,7 @@ use pliron::irbuild::rewriter::Rewriter;
 use pliron::location::Located;
 use pliron::op::Op;
 use pliron::operation::Operation;
+use pliron::printable::Printable;
 use pliron::result::Result;
 use pliron::r#type::{Typed, type_cast};
 
@@ -339,11 +342,31 @@ fn emit_unsize_cast(
     let array_len = {
         let mir_ref = mir_opd_ty.deref(ctx);
         mir_ref.downcast_ref::<MirPtrType>().and_then(|ptr_ty| {
-            ptr_ty
-                .pointee
-                .deref(ctx)
-                .downcast_ref::<MirArrayType>()
-                .map(|arr| arr.size())
+            let pointee_ref = ptr_ty.pointee.deref(ctx);
+            if let Some(arr) = pointee_ref.downcast_ref::<MirArrayType>() {
+                // `&[T; N] -> &[T]`: the classic array unsize.
+                Some(arr.size())
+            } else if let Some(struct_ty) =
+                pointee_ref.downcast_ref::<dialect_mir::types::MirStructType>()
+            {
+                // `&S<[T; N]> -> &S<[T]>` where the struct's LAST field is
+                // the array that becomes the unsized tail (e.g. the
+                // `PolymorphicIter` inside `core::array::IntoIter`, which
+                // every `for x in arr` loop unsizes; issue #138). The fat
+                // pointer's metadata is that array's element count.
+                let field_types = struct_ty.field_types();
+                let last_decl_idx = match struct_ty.memory_order().last().copied() {
+                    Some(idx) => idx,
+                    None => field_types.len().checked_sub(1)?,
+                };
+                field_types.get(last_decl_idx).and_then(|t| {
+                    t.deref(ctx)
+                        .downcast_ref::<MirArrayType>()
+                        .map(|a| a.size())
+                })
+            } else {
+                None
+            }
         })
     };
 
@@ -383,6 +406,9 @@ fn emit_unsize_cast(
 /// - struct → ptr: `extractvalue` field 0 (extract data pointer from fat pointer)
 /// - ptr → struct: `insertvalue` into undef at field 0 (wrap thin ptr in fat pointer)
 /// - ptr → ptr (different address space): `addrspacecast`
+/// - array ↔ anything: memory round-trip (`alloca` + `store` + `load`),
+///   because `bitcast` is only defined between non-aggregate first-class
+///   types (e.g. `u32::from_ne_bytes` transmutes `[u8; 4]` → `u32`)
 /// - otherwise: `bitcast`
 fn emit_pointer_cast(
     ctx: &mut Context,
@@ -405,6 +431,8 @@ fn emit_pointer_cast(
     let dst_is_ptr = dst_as.is_some();
     let src_is_ptr = src_as.is_some();
     let src_is_int = val_ty.deref(ctx).is::<IntegerType>();
+    let src_is_array = val_ty.deref(ctx).is::<llvm_export::types::ArrayType>();
+    let dst_is_array = llvm_ty.deref(ctx).is::<llvm_export::types::ArrayType>();
 
     // Niched-enum Transmute first. Rustc stores `Option<NonZeroT>`,
     // `Option<&T>`, `Option<Box<T>>`, `Option<NonNull<T>>`,
@@ -420,7 +448,7 @@ fn emit_pointer_cast(
         && let Some(niche) = read_niche_info(ctx, op)
         && (src_is_int || src_is_ptr)
     {
-        return emit_scalar_to_niched_enum(ctx, rewriter, val, val_ty, llvm_ty, niche);
+        return emit_scalar_to_niched_enum(ctx, rewriter, op, val, val_ty, llvm_ty, niche);
     }
 
     if src_is_struct && dst_is_ptr {
@@ -474,6 +502,12 @@ fn emit_pointer_cast(
         )
     } else if src_is_struct && llvm_ty.deref(ctx).is::<IntegerType>() {
         emit_struct_to_scalar(ctx, rewriter, val, val_ty, llvm_ty)
+    } else if src_is_array || dst_is_array {
+        // Array on either side (e.g. `u32::from_ne_bytes` is a
+        // `[u8; 4]` → `u32` Transmute, `u32::to_ne_bytes` the reverse).
+        // LLVM's `bitcast` is only defined between non-aggregate
+        // first-class types, so an aggregate must go through memory.
+        emit_transmute_via_memory(ctx, rewriter, val, val_ty, llvm_ty)
     } else {
         Ok(llvm::BitcastOp::new(ctx, val, llvm_ty).get_operation())
     }
@@ -582,6 +616,7 @@ fn read_niche_info(
 fn emit_scalar_to_niched_enum(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
     val: pliron::value::Value,
     val_ty: Ptr<pliron::r#type::TypeObj>,
     llvm_ty: Ptr<pliron::r#type::TypeObj>,
@@ -601,6 +636,41 @@ fn emit_scalar_to_niched_enum(
             );
         }
         (s.field_type(0), s.field_type(1))
+    };
+
+    // Field 0 carries ONE tag semantic everywhere: the variant's declared
+    // discriminant VALUE. The niche attribute records variant INDICES, so
+    // map them through the result enum's variant_discriminants before
+    // storing. For Option-likes (discriminants [0, 1]) this is the
+    // identity, but enums with explicit discriminants must not see a raw
+    // index in the tag slot (issue #132 groundwork).
+    let (niche_disc_value, untagged_disc_value) = {
+        let mir_result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+        let mir_result_ty_obj = mir_result_ty.deref(ctx);
+        let enum_ty = mir_result_ty_obj
+            .downcast_ref::<dialect_mir::types::MirEnumType>()
+            .ok_or_else(|| {
+                pliron::input_error_noloc!(
+                    "emit_scalar_to_niched_enum: niche-encoded cast result is not a MirEnumType"
+                )
+            })?;
+        let discr_of = |idx: u32| -> Result<u64> {
+            enum_ty
+                .variant_discriminants
+                .get(idx as usize)
+                .copied()
+                .ok_or_else(|| {
+                    pliron::input_error_noloc!(
+                        "emit_scalar_to_niched_enum: variant index {} has no discriminant ({} discriminants recorded)",
+                        idx,
+                        enum_ty.variant_discriminants.len()
+                    )
+                })
+        };
+        (
+            discr_of(niche.niche_variant_idx)?,
+            discr_of(niche.untagged_variant_idx)?,
+        )
     };
 
     // Build a comparison constant in the source's own type. For integer
@@ -628,8 +698,8 @@ fn emit_scalar_to_niched_enum(
     rewriter.insert_operation(ctx, icmp.get_operation());
     let is_niche = icmp.get_operation().deref(ctx).get_result(0);
 
-    let niche_disc = const_int_of(ctx, rewriter, disc_ty, niche.niche_variant_idx as i64)?;
-    let untagged_disc = const_int_of(ctx, rewriter, disc_ty, niche.untagged_variant_idx as i64)?;
+    let niche_disc = const_int_of(ctx, rewriter, disc_ty, niche_disc_value as i64)?;
+    let untagged_disc = const_int_of(ctx, rewriter, disc_ty, untagged_disc_value as i64)?;
     let disc_select = llvm::SelectOp::new(ctx, is_niche, niche_disc, untagged_disc);
     rewriter.insert_operation(ctx, disc_select.get_operation());
     let disc = disc_select.get_operation().deref(ctx).get_result(0);
@@ -727,6 +797,164 @@ fn single_scalar_struct_width(ctx: &Context, ty: Ptr<pliron::r#type::TypeObj>) -
         current = s.field_type(0);
     }
     None
+}
+
+/// Equal-size Transmute through memory: `alloca` a stack slot, `store` the
+/// source value into it, then `load` it back as the destination type.
+///
+/// This is the only valid lowering when either side is an aggregate,
+/// because LLVM's `bitcast` is restricted to non-aggregate first-class
+/// types (an aggregate bitcast such as `bitcast [4 x i8] %v to i32` is
+/// rejected by `llc` with "invalid cast opcode"). The `opt -O2` middle
+/// end folds the round-trip away, so no real stack traffic survives.
+///
+/// Guarded by a total-byte-size equality check so a size-mismatched
+/// transmute fails loudly at compile time instead of silently truncating
+/// the source or loading bytes that were never stored.
+///
+/// The stack slot is aligned to the larger of the two types' ABI
+/// alignments. For `[u8; 4]` → `u32` the byte array alone would give the
+/// slot align 1, making the 4-byte integer load under-aligned; raising
+/// the slot to align 4 keeps both accesses natural. The chosen alignment
+/// is stamped explicitly on all three ops so the textual exporter does
+/// not fall back to each type's own (possibly smaller) natural alignment.
+fn emit_transmute_via_memory(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    val: pliron::value::Value,
+    val_ty: Ptr<pliron::r#type::TypeObj>,
+    llvm_ty: Ptr<pliron::r#type::TypeObj>,
+) -> Result<Ptr<Operation>> {
+    let Some(src_bytes) = type_byte_size(ctx, val_ty) else {
+        return pliron::input_err_noloc!(
+            "Transmute via memory round-trip: cannot compute the total size of source type {}. \
+             Refusing to lower (see issue #125).",
+            val_ty.disp(ctx)
+        );
+    };
+    let Some(dst_bytes) = type_byte_size(ctx, llvm_ty) else {
+        return pliron::input_err_noloc!(
+            "Transmute via memory round-trip: cannot compute the total size of destination \
+             type {}. Refusing to lower (see issue #125).",
+            llvm_ty.disp(ctx)
+        );
+    };
+    if src_bytes != dst_bytes {
+        return pliron::input_err_noloc!(
+            "aggregate Transmute size mismatch: source {} is {} bytes, destination {} is {} \
+             bytes. Refusing the memory round-trip that would silently miscompile \
+             (see issue #125).",
+            val_ty.disp(ctx),
+            src_bytes,
+            llvm_ty.disp(ctx),
+            dst_bytes
+        );
+    }
+
+    // The slot must satisfy whichever side needs the stricter alignment.
+    let align = abi_alignment_bytes(ctx, val_ty).max(abi_alignment_bytes(ctx, llvm_ty));
+
+    let one = const_i64(ctx, rewriter, 1);
+    let alloca = llvm::AllocaOp::new(ctx, val_ty, one);
+    llvm_export::ops::set_op_alignment(ctx, alloca.get_operation(), align);
+    rewriter.insert_operation(ctx, alloca.get_operation());
+    let ptr = alloca.get_operation().deref(ctx).get_result(0);
+
+    let store = llvm::StoreOp::new(ctx, val, ptr);
+    llvm_export::ops::set_op_alignment(ctx, store.get_operation(), align);
+    rewriter.insert_operation(ctx, store.get_operation());
+
+    let load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
+    llvm_export::ops::set_op_alignment(ctx, load.get_operation(), align);
+    Ok(load.get_operation())
+}
+
+/// Total size in bytes of an LLVM-dialect type, for transmute size
+/// checking. Integer widths are rounded up to whole bytes because the
+/// memory round-trip operates at byte granularity (an `i1` occupies one
+/// byte in a stack slot).
+///
+/// Covers integers, floats, pointers (64-bit on our CUDA targets),
+/// arrays (element size times length), and structs whose fields tile the
+/// layout with no padding. Returns `None` when the size cannot be
+/// computed confidently (a struct that needs padding, an opaque struct,
+/// or an unknown type), so callers refuse the transmute loudly instead
+/// of guessing.
+fn type_byte_size(ctx: &Context, ty: Ptr<pliron::r#type::TypeObj>) -> Option<u64> {
+    let r = ty.deref(ctx);
+    if let Some(i) = r.downcast_ref::<IntegerType>() {
+        return Some((i.width() as u64).div_ceil(8));
+    }
+    if let Some(f) = type_cast::<dyn FloatTypeInterface>(&**r) {
+        return Some((f.get_semantics().bits as u64).div_ceil(8));
+    }
+    if r.is::<llvm_export::types::PointerType>() {
+        // CUDA targets use 64-bit pointers in every address space we emit.
+        return Some(8);
+    }
+    if let Some(a) = r.downcast_ref::<llvm_export::types::ArrayType>() {
+        let elem_bytes = type_byte_size(ctx, a.elem_type())?;
+        return elem_bytes.checked_mul(a.size());
+    }
+    if let Some(s) = r.downcast_ref::<llvm_export::types::StructType>() {
+        if s.is_opaque() {
+            return None;
+        }
+        // A struct's size is only trustworthy when the fields tile the
+        // layout exactly: each field starts where the previous one ended
+        // (no inter-field padding) and the total is a multiple of the
+        // struct's own alignment (no tail padding). Anything else would
+        // make the store/load round-trip move padding bytes around.
+        let mut offset: u64 = 0;
+        let mut max_align: u64 = 1;
+        for field in s.fields() {
+            let field_align = abi_alignment_bytes(ctx, field) as u64;
+            if !offset.is_multiple_of(field_align) {
+                return None; // inter-field padding required
+            }
+            offset += type_byte_size(ctx, field)?;
+            max_align = max_align.max(field_align);
+        }
+        if !offset.is_multiple_of(max_align) {
+            return None; // tail padding required
+        }
+        return Some(offset);
+    }
+    None
+}
+
+/// Conservative ABI alignment (bytes) of an LLVM-dialect type. Mirrors
+/// the natural-alignment fallback in the textual `.ll` exporter so the
+/// alignment stamped on a transmute stack slot agrees with what the
+/// exporter assumes for direct loads/stores of the same type.
+fn abi_alignment_bytes(ctx: &Context, ty: Ptr<pliron::r#type::TypeObj>) -> u32 {
+    let r = ty.deref(ctx);
+    if let Some(i) = r.downcast_ref::<IntegerType>() {
+        return std::cmp::max(1, i.width() / 8);
+    }
+    if let Some(f) = type_cast::<dyn FloatTypeInterface>(&**r) {
+        return std::cmp::max(1, (f.get_semantics().bits / 8) as u32);
+    }
+    if r.is::<llvm_export::types::PointerType>() {
+        return 8;
+    }
+    if let Some(a) = r.downcast_ref::<llvm_export::types::ArrayType>() {
+        // An array aligns like its element type.
+        return abi_alignment_bytes(ctx, a.elem_type());
+    }
+    if let Some(s) = r.downcast_ref::<llvm_export::types::StructType>() {
+        if s.is_opaque() {
+            return 8;
+        }
+        // A struct aligns like its most-aligned field (1 if empty).
+        return s
+            .fields()
+            .map(|f| abi_alignment_bytes(ctx, f))
+            .max()
+            .unwrap_or(1);
+    }
+    // Conservative fallback for unknown types.
+    8
 }
 
 /// Float → float: extend or truncate precision.

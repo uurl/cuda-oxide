@@ -29,36 +29,41 @@
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, kernel, thread};
-use cuda_host::{cuda_launch, ltoir};
+use cuda_host::{cuda_module, ltoir};
 
 // =============================================================================
 // KERNELS
 // =============================================================================
 
-/// Stores `f32::NAN`, `f32::INFINITY`, `f32::NEG_INFINITY`, and a finite
-/// control value so the constants reach `format_float_literal` as `float`
-/// SSA values.
-#[kernel]
-pub fn fp_special_literal_f32_kernel(mut out: DisjointSlice<f32>) {
-    if thread::index_1d().get() == 0 {
-        unsafe {
-            *out.get_unchecked_mut(0) = f32::NAN;
-            *out.get_unchecked_mut(1) = f32::INFINITY;
-            *out.get_unchecked_mut(2) = f32::NEG_INFINITY;
-            *out.get_unchecked_mut(3) = 1.5_f32;
+#[cuda_module]
+mod kernels {
+    use super::*;
+
+    /// Stores `f32::NAN`, `f32::INFINITY`, `f32::NEG_INFINITY`, and a finite
+    /// control value so the constants reach `format_float_literal` as `float`
+    /// SSA values.
+    #[kernel]
+    pub fn fp_special_literal_f32_kernel(mut out: DisjointSlice<f32>) {
+        if thread::index_1d().get() == 0 {
+            unsafe {
+                *out.get_unchecked_mut(0) = f32::NAN;
+                *out.get_unchecked_mut(1) = f32::INFINITY;
+                *out.get_unchecked_mut(2) = f32::NEG_INFINITY;
+                *out.get_unchecked_mut(3) = 1.5_f32;
+            }
         }
     }
-}
 
-/// Same as `fp_special_literal_f32_kernel` for `f64`.
-#[kernel]
-pub fn fp_special_literal_f64_kernel(mut out: DisjointSlice<f64>) {
-    if thread::index_1d().get() == 0 {
-        unsafe {
-            *out.get_unchecked_mut(0) = f64::NAN;
-            *out.get_unchecked_mut(1) = f64::INFINITY;
-            *out.get_unchecked_mut(2) = f64::NEG_INFINITY;
-            *out.get_unchecked_mut(3) = 1.5_f64;
+    /// Same as `fp_special_literal_f32_kernel` for `f64`.
+    #[kernel]
+    pub fn fp_special_literal_f64_kernel(mut out: DisjointSlice<f64>) {
+        if thread::index_1d().get() == 0 {
+            unsafe {
+                *out.get_unchecked_mut(0) = f64::NAN;
+                *out.get_unchecked_mut(1) = f64::INFINITY;
+                *out.get_unchecked_mut(2) = f64::NEG_INFINITY;
+                *out.get_unchecked_mut(3) = 1.5_f64;
+            }
         }
     }
 }
@@ -74,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
 
     let module = ltoir::load_kernel_module(&ctx, "fp_special_literal_smoke")?;
+    let module = kernels::from_module(module)?;
     let cfg = LaunchConfig::for_num_elems(1);
 
     let mut passed = 0u32;
@@ -82,11 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------- f32 ----------
     {
         let mut out = DeviceBuffer::<f32>::zeroed(&stream, 4)?;
-        cuda_launch! {
-            kernel: fp_special_literal_f32_kernel,
-            stream: stream, module: module, config: cfg,
-            args: [slice_mut(out)]
-        }?;
+        module.fp_special_literal_f32_kernel(&stream, cfg, &mut out)?;
         let got = out.to_host_vec(&stream)?;
         check_f32_specials(&got, &mut passed, &mut failed);
     }
@@ -94,11 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------- f64 ----------
     {
         let mut out = DeviceBuffer::<f64>::zeroed(&stream, 4)?;
-        cuda_launch! {
-            kernel: fp_special_literal_f64_kernel,
-            stream: stream, module: module, config: cfg,
-            args: [slice_mut(out)]
-        }?;
+        module.fp_special_literal_f64_kernel(&stream, cfg, &mut out)?;
         let got = out.to_host_vec(&stream)?;
         check_f64_specials(&got, &mut passed, &mut failed);
     }

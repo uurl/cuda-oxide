@@ -45,6 +45,7 @@
 
 pub mod block;
 pub mod body;
+pub(crate) mod layout;
 pub mod rvalue;
 pub mod statement;
 pub mod terminator;

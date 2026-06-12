@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! End-to-end repro for `llvm.addressof` export ordering (issue #54).
+//! Static shared-memory access through `llvm.addressof` (guards issue #54).
 //!
 //! The kernel does `OUTPUT_NORM[0] = OUTPUT_NORM[0] * weight` on a static
 //! `SharedArray<f32, 1>`. Before the fix in PR #55, the llvm-export textual exporter
@@ -19,7 +19,7 @@
 //! libNVVM's verifier before the kernel could run, so a regression of #54
 //! is now a hard runtime failure instead of a silent build artifact.
 //!
-//! Run: `cargo oxide run addressof_sharedarray_repro`
+//! Run: `cargo oxide run addressof_sharedarray`
 
 #![allow(static_mut_refs)]
 #![allow(clippy::assign_op_pattern)] // Expanded assignment preserves the addressof repro CFG.
@@ -55,14 +55,14 @@ mod kernels {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== addressof_sharedarray_repro (issue #54 regression) ===");
+    println!("=== addressof_sharedarray (issue #54 regression) ===");
 
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
     // Forces the cuda-oxide-emitted `.ll` through libNVVM + nvJitLink.
     // A dangling SSA reference in the IR would fail libNVVM's verifier here.
-    let raw_module = ltoir::load_kernel_module(&ctx, "addressof_sharedarray_repro")?;
+    let raw_module = ltoir::load_kernel_module(&ctx, "addressof_sharedarray")?;
     let module = kernels::from_module(raw_module).expect("typed module init failed");
 
     let cfg = LaunchConfig::for_num_elems(1);
@@ -75,10 +75,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let expected: f32 = 21.0; // seed * repro_weight() == 7.0 * 3.0
 
     if (result - expected).abs() < f32::EPSILON {
-        println!("PASS addressof_sharedarray_repro: seed={seed}, result={result}");
+        println!("PASS addressof_sharedarray: seed={seed}, result={result}");
         Ok(())
     } else {
-        eprintln!("FAIL addressof_sharedarray_repro: got {result}, expected {expected}");
+        eprintln!("FAIL addressof_sharedarray: got {result}, expected {expected}");
         std::process::exit(1);
     }
 }

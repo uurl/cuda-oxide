@@ -742,7 +742,20 @@ fn write_device_artifact_object(
     }
 
     let blob = oxide_artifacts::build_artifact_blob(&spec)?;
-    let object = oxide_artifacts::build_host_object_for_target(&blob, host_target)?;
+    // Define a link-anchor symbol at the start of the `.oxart` data. When
+    // this crate is a library, the artifact object becomes an rlib archive
+    // member, and the linker only extracts it if some other object holds an
+    // undefined reference to a symbol defined here. The `#[cuda_module]`
+    // macro emits that reference from the generated `load_named()`, derived
+    // from the same CARGO_PKG_NAME / CARGO_PKG_VERSION environment that this
+    // rustc invocation sees, so the two names always match. Without the
+    // anchor, library-crate bundles were dead-stripped and `load()` failed
+    // at runtime with ModuleNotFound (issue #72).
+    let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let anchor_symbol =
+        reserved_oxide_symbols::artifact_anchor_symbol(&bundle_name, &package_version);
+    let object =
+        oxide_artifacts::build_host_object_for_target(&blob, host_target, Some(&anchor_symbol))?;
     let safe_output_name = sanitize_path_component(output_name);
     let artifact_id = ARTIFACT_OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let object_dir = output_dir

@@ -231,6 +231,7 @@ compiles a Rust kernel to PTX, launches it on the GPU, and prints
 | `vecadd`             | Vector addition -- canonical first example                               |
 | `host_closure`       | Generic kernels with closures passed from host                           |
 | `generic`            | Generic kernels with monomorphization (`scale<T>`)                       |
+| `ord_cmp`            | Device-side `Ord::cmp` lowering for signed and unsigned integers         |
 | `gemm_sol`           | GEMM SoL: 868 TFLOPS, 58% cublasLt SoL on B200 (148 SMs); 8 kernels      |
 | `tcgen05`            | Blackwell tensor cores (sm_100a): TMEM, MMA, cta_group::2                |
 | `atomics`            | GPU atomics: 6 types x 3 scopes x 5 orderings (20 tests)                 |
@@ -240,6 +241,7 @@ compiles a Rust kernel to PTX, launches it on the GPU, and prints
 | `device_ffi_test`    | Device FFI: Rust kernels calling C++ CCCL warp-level reductions via LTOIR|
 | `async_vecadd`       | Async GPU execution with `cuda-async` and `DeviceOperation`              |
 | `cross_crate_kernel` | Library crates defining kernels, bundled into binaries                   |
+| `cuda_module_in_lib` | `#[cuda_module]` in a library crate, loaded by embedded bundle name      |
 
 ```bash
 cargo oxide run vecadd

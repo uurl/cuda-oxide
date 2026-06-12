@@ -105,10 +105,13 @@ The `examples/` directory contains standalone kernel crates that exercise differ
 |------------------------------|------------------------------------------------------------|
 | `vecadd`                     | Basic vector addition -- the "hello world" kernel          |
 | `generic`                    | Generic kernels (`scale<T>`)                               |
+| `ord_cmp`                    | Device-side `Ord::cmp` for signed and unsigned integers    |
 | `manual_launch_generic`      | Lower-level generic launch API regression                  |
 | `cuda_module_contract`       | Typed launch ABI argument marshalling                      |
 | `abi_hmm`                    | HMM pointers, struct layout, closures                      |
 | `device_closures`            | Move and non-move closures passed to kernels               |
+| `ref_index_projections`      | Borrow / raw-pointer address projections (issue #120)      |
+| `ref_operand_mul`            | `Mul` impl on `&Foo` with `Output = Foo` (issue #133)      |
 | `cross_crate_kernel`         | Kernels defined in a library crate                         |
 | `async_vecadd`               | Async CUDA streams with `cuda-async`                       |
 | `async_mlp`                  | Multi-layer perceptron using async streams                 |

@@ -89,7 +89,7 @@ For each `MirFuncOp`, `convert_func` (in `lowering.rs`):
 | `mir.slice`          | `llvm.struct {ptr, i64}`                            |
 | `mir.disjoint_slice` | `llvm.struct {ptr, i64}` (same as slice)            |
 | `mir.struct`         | `llvm.struct` (padded if layout known, else flat)   |
-| `mir.enum`           | `llvm.struct {discriminant, variant_fields...}`     |
+| `mir.enum`           | `llvm.struct` matching rustc's byte layout          |
 
 ### GPU Intrinsic Converters (`convert/intrinsics/`)
 

@@ -53,6 +53,8 @@ impl<'a> ModuleExportState<'a> {
             ),
         ));
         self.debug_subprogram_files.insert(id, path);
+        self.debug_subprogram_fallbacks
+            .insert(id, (pos.line, pos.column));
 
         Some(id)
     }
@@ -63,6 +65,7 @@ impl<'a> ModuleExportState<'a> {
         output_before: usize,
         scope: Option<usize>,
         loc: &Location,
+        allow_scope_fallback: bool,
     ) {
         if output.len() == output_before {
             return;
@@ -71,7 +74,18 @@ impl<'a> ModuleExportState<'a> {
         let Some(scope) = scope else {
             return;
         };
-        let Some(location_id) = self.debug_location_for_scope(scope, loc) else {
+        let location_id = self.debug_location_for_scope(scope, loc).or_else(|| {
+            if allow_scope_fallback {
+                // LLVM rejects inlinable calls inside a debug-scoped function
+                // unless the call itself has a location. When rustc/pliron did
+                // not give the call one, point it at the function line instead
+                // of letting opt discard the whole debug graph.
+                self.debug_fallback_location_for_scope(scope)
+            } else {
+                None
+            }
+        });
+        let Some(location_id) = location_id else {
             return;
         };
 
@@ -188,6 +202,23 @@ impl<'a> ModuleExportState<'a> {
                 "!DILocation(line: {}, column: {}, scope: !{})",
                 pos.line, pos.column, scope
             ),
+        ));
+        self.debug_locations.insert(key, id);
+
+        Some(id)
+    }
+
+    fn debug_fallback_location_for_scope(&mut self, scope: usize) -> Option<usize> {
+        let (line, column) = self.debug_subprogram_fallbacks.get(&scope).copied()?;
+        let key = (scope, line, column);
+        if let Some(id) = self.debug_locations.get(&key).copied() {
+            return Some(id);
+        }
+
+        let id = self.alloc_metadata_id();
+        self.debug_nodes.push((
+            id,
+            format!("!DILocation(line: {line}, column: {column}, scope: !{scope})"),
         ));
         self.debug_locations.insert(key, id);
 

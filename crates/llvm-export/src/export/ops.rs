@@ -224,6 +224,10 @@ impl LlvmOp<'_> {
             Self::Undef(_) | Self::Constant(_) | Self::AddressOf(_)
         )
     }
+
+    fn needs_scoped_debug_location(&self) -> bool {
+        matches!(self, Self::Call(_))
+    }
 }
 
 impl<'a> ModuleExportState<'a> {
@@ -241,6 +245,9 @@ impl<'a> ModuleExportState<'a> {
         let op_obj = Operation::get_op_dyn(op, self.ctx);
         let llvm_op = LlvmOp::try_from(op_obj.as_ref()).ok();
         let should_attach_debug = llvm_op.as_ref().is_some_and(LlvmOp::emits_real_instruction);
+        let allow_scope_debug_fallback = llvm_op
+            .as_ref()
+            .is_some_and(LlvmOp::needs_scoped_debug_location);
         let output_before = output.len();
 
         // Register result names (skip if already named in pre-pass)
@@ -388,7 +395,13 @@ impl<'a> ModuleExportState<'a> {
         }
 
         if should_attach_debug {
-            self.attach_debug_to_last_line(output, output_before, debug_scope, &op_loc);
+            self.attach_debug_to_last_line(
+                output,
+                output_before,
+                debug_scope,
+                &op_loc,
+                allow_scope_debug_fallback,
+            );
         }
 
         Ok(())

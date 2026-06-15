@@ -66,6 +66,8 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) debug_subroutine_type: Option<usize>,
     /// `DISubprogram` file paths, used to avoid attaching locations to the wrong scope.
     pub(super) debug_subprogram_files: HashMap<usize, PathBuf>,
+    /// Fallback line/column for calls that LLVM requires to have a location.
+    pub(super) debug_subprogram_fallbacks: HashMap<usize, (i32, i32)>,
     /// `DILocation` nodes keyed by `(scope, line, column)`.
     pub(super) debug_locations: HashMap<(usize, i32, i32), usize>,
     /// Numbered debug metadata definitions, in allocation order.
@@ -94,6 +96,7 @@ impl<'a> ModuleExportState<'a> {
             debug_files: HashMap::new(),
             debug_subroutine_type: None,
             debug_subprogram_files: HashMap::new(),
+            debug_subprogram_fallbacks: HashMap::new(),
             debug_locations: HashMap::new(),
             debug_nodes: Vec::new(),
         }

@@ -9,13 +9,14 @@ use llvm_export::{
         DebugKind, ExportBackendConfig, NvvmExportConfig, PtxExportConfig, export_module_to_string,
         export_module_to_string_with_config,
     },
-    ops::{AddressOfOp, BrOp, FuncOp, GepIndex, GetElementPtrOp, GlobalOp, ReturnOp},
+    ops::{AddressOfOp, BrOp, CallOp, FuncOp, GepIndex, GetElementPtrOp, GlobalOp, ReturnOp},
     types::{FuncType, VoidType},
 };
 use pliron::{
     basic_block::BasicBlock,
     builtin::{
         attributes::{IntegerAttr, StringAttr},
+        op_interfaces::CallOpCallable,
         ops::ModuleOp,
         types::{IntegerType, Signedness},
     },
@@ -346,6 +347,63 @@ fn debug_metadata_shares_allocator_with_nvvm_metadata() {
     assert!(
         ir.contains("!llvm.module.flags = !{!7, !8}"),
         "debug module flags should also use the shared allocator:\n{ir}"
+    );
+}
+
+#[test]
+fn line_table_debug_metadata_adds_fallback_locations_to_calls() {
+    let mut ctx = Context::new();
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = {
+        let region = module_region.deref(&ctx);
+        region.iter(&ctx).next().unwrap()
+    };
+
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let void_ty = VoidType::get(&ctx);
+    let helper_ty = FuncType::get(&mut ctx, i32_ty.to_ptr(), vec![], false);
+    let helper = FuncOp::new(&mut ctx, "helper".try_into().unwrap(), helper_ty);
+    helper.get_operation().insert_at_back(module_block, &ctx);
+
+    let caller_ty = FuncType::get(&mut ctx, void_ty.to_ptr(), vec![], false);
+    let caller = FuncOp::new(&mut ctx, "debug_kernel".try_into().unwrap(), caller_ty);
+    let caller_loc = src_location(&mut ctx, "/tmp/cuda-oxide/tests/kernel.rs", 20, 3);
+    caller.get_operation().deref_mut(&ctx).set_loc(caller_loc);
+
+    let entry = caller.get_or_create_entry_block(&mut ctx);
+    let call = CallOp::new(
+        &mut ctx,
+        CallOpCallable::Direct("helper".try_into().unwrap()),
+        helper_ty,
+        vec![],
+    );
+    call.get_operation().insert_at_back(entry, &ctx);
+    ReturnOp::new(&mut ctx, None)
+        .get_operation()
+        .insert_at_back(entry, &ctx);
+
+    caller.get_operation().insert_at_back(module_block, &ctx);
+
+    let config = DebugConfig {
+        inner: PtxExportConfig,
+        debug_kind: DebugKind::LineTables,
+    };
+    let ir =
+        export_module_to_string_with_config(&ctx, &module, &config).expect("debug export succeeds");
+
+    let call_line = ir
+        .lines()
+        .find(|line| line.contains("call i32 @helper()"))
+        .expect("call instruction");
+    assert!(
+        call_line.contains(", !dbg !"),
+        "calls without their own source span should use the function fallback location:\n{ir}"
+    );
+    assert!(
+        ir.contains("!DILocation(line: 20, column: 3, scope: !"),
+        "fallback call location should point at the caller's function line:\n{ir}"
     );
 }
 

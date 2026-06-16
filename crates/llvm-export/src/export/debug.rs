@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Line-table debug metadata emission.
+//! Debug metadata emission.
 //!
-//! Stage 2 deliberately emits only the debug-info pieces needed to map machine
-//! instructions back to source lines. Locals, argument variables, lexical
-//! blocks, and Rust types need more MIR/type plumbing and belong to later stages.
+//! Line-table mode emits just enough metadata to map machine instructions back
+//! to source lines. Full mode builds on that with the first variable/type slice:
+//! simple source locals are described with `llvm.dbg.declare` and compact DWARF
+//! type nodes.
 
 use std::{
     fmt::Write,
@@ -19,6 +20,8 @@ use pliron::{
     location::{Location, Source},
     uniqued_any,
 };
+
+use crate::ops::{DebugLocalTypeKind, DebugLocalVariableInfo};
 
 use super::state::ModuleExportState;
 
@@ -95,6 +98,16 @@ impl<'a> ModuleExportState<'a> {
         }
     }
 
+    pub(super) fn emit_debug_intrinsic_declarations(&self, output: &mut String) {
+        if self.debug_declare_used {
+            writeln!(
+                output,
+                "declare void @llvm.dbg.declare(metadata, metadata, metadata)"
+            )
+            .unwrap();
+        }
+    }
+
     pub(super) fn emit_debug_metadata(&mut self, output: &mut String) {
         let Some(cu_id) = self.debug_compile_unit else {
             return;
@@ -125,6 +138,47 @@ impl<'a> ModuleExportState<'a> {
         }
     }
 
+    pub(super) fn debug_local_variable_for_scope(
+        &mut self,
+        scope: usize,
+        loc: &Location,
+        info: &DebugLocalVariableInfo,
+    ) -> Option<(usize, usize)> {
+        if !self.debug_kind.variables_enabled() {
+            return None;
+        }
+
+        let (path, pos) = self.source_position_from_location(loc)?;
+        if self
+            .debug_subprogram_files
+            .get(&scope)
+            .is_some_and(|scope_path| scope_path.as_path() != path)
+        {
+            return None;
+        }
+
+        let file_id = self.ensure_debug_file(&path);
+        let type_id = self.ensure_debug_type(&info.ty);
+        let location_id = self.debug_location_for_scope(scope, loc)?;
+        let name = escape_debug_string(&info.name);
+        let arg = info
+            .argument_index
+            .map(|idx| format!("arg: {idx}, "))
+            .unwrap_or_default();
+        let id = self.alloc_metadata_id();
+
+        self.debug_nodes.push((
+            id,
+            format!(
+                "!DILocalVariable(name: \"{name}\", {arg}scope: !{scope}, file: !{file_id}, \
+                 line: {}, type: !{type_id})",
+                pos.line
+            ),
+        ));
+
+        Some((id, location_id))
+    }
+
     fn ensure_debug_compile_unit(&mut self, path: &Path) -> usize {
         if let Some(id) = self.debug_compile_unit {
             return id;
@@ -132,12 +186,22 @@ impl<'a> ModuleExportState<'a> {
 
         let file_id = self.ensure_debug_file(path);
         let id = self.alloc_metadata_id();
+        let is_optimized = if self.debug_kind.variables_enabled() {
+            "false"
+        } else {
+            "true"
+        };
+        let emission_kind = if self.debug_kind.variables_enabled() {
+            "FullDebug"
+        } else {
+            "LineTablesOnly"
+        };
         self.debug_nodes.push((
             id,
             format!(
                 "distinct !DICompileUnit(language: DW_LANG_Rust, file: !{file_id}, \
-                 producer: \"cuda-oxide\", isOptimized: true, runtimeVersion: 0, \
-                 emissionKind: LineTablesOnly)"
+                 producer: \"cuda-oxide\", isOptimized: {is_optimized}, runtimeVersion: 0, \
+                 emissionKind: {emission_kind})"
             ),
         ));
         self.debug_compile_unit = Some(id);
@@ -172,6 +236,36 @@ impl<'a> ModuleExportState<'a> {
         self.debug_nodes
             .push((id, "!DISubroutineType(types: !{null})".to_string()));
         self.debug_subroutine_type = Some(id);
+
+        id
+    }
+
+    fn ensure_debug_type(&mut self, ty: &DebugLocalTypeKind) -> usize {
+        if let Some(id) = self.debug_types.get(ty).copied() {
+            return id;
+        }
+
+        let node = match ty {
+            DebugLocalTypeKind::Basic {
+                name,
+                size_bits,
+                encoding,
+            } => {
+                let name = escape_debug_string(name);
+                format!("!DIBasicType(name: \"{name}\", size: {size_bits}, encoding: {encoding})")
+            }
+            DebugLocalTypeKind::Pointer { name, size_bits } => {
+                let name = escape_debug_string(name);
+                format!(
+                    "!DIDerivedType(tag: DW_TAG_pointer_type, name: \"{name}\", \
+                     baseType: null, size: {size_bits})"
+                )
+            }
+        };
+
+        let id = self.alloc_metadata_id();
+        self.debug_nodes.push((id, node));
+        self.debug_types.insert(ty.clone(), id);
 
         id
     }

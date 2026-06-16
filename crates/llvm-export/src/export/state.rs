@@ -8,6 +8,8 @@
 use pliron::{basic_block::BasicBlock, context::Ptr, value::Value};
 use std::{collections::HashMap, path::PathBuf};
 
+use crate::ops::DebugLocalTypeKind;
+
 use super::config::DebugKind;
 
 /// Map from block to its predecessors with the values passed to each predecessor.
@@ -70,8 +72,12 @@ pub(super) struct ModuleExportState<'a> {
     pub(super) debug_subprogram_fallbacks: HashMap<usize, (i32, i32)>,
     /// `DILocation` nodes keyed by `(scope, line, column)`.
     pub(super) debug_locations: HashMap<(usize, i32, i32), usize>,
+    /// `DIType` nodes keyed by the simple debug type they describe.
+    pub(super) debug_types: HashMap<DebugLocalTypeKind, usize>,
     /// Numbered debug metadata definitions, in allocation order.
     pub(super) debug_nodes: Vec<(usize, String)>,
+    /// Whether any function emitted `llvm.dbg.declare`.
+    pub(super) debug_declare_used: bool,
 }
 
 impl<'a> ModuleExportState<'a> {
@@ -98,7 +104,9 @@ impl<'a> ModuleExportState<'a> {
             debug_subprogram_files: HashMap::new(),
             debug_subprogram_fallbacks: HashMap::new(),
             debug_locations: HashMap::new(),
+            debug_types: HashMap::new(),
             debug_nodes: Vec::new(),
+            debug_declare_used: false,
         }
     }
 

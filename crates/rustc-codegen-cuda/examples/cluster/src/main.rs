@@ -87,7 +87,14 @@ mod kernels {
     // ============================================================================
 
     /// Test kernel for cluster_sync().
+    ///
+    /// `cluster_sync` only has meaning when the kernel actually runs as a
+    /// thread-block cluster, so this must carry `#[cluster_launch(...)]` like
+    /// the DSMEM tests below. Without it the grid launches as ordinary blocks,
+    /// every block is its own size-1 cluster, `block_rank()` is always 0, and
+    /// only `output[0]` is written.
     #[kernel]
+    #[cluster_launch(4, 1, 1)]
     pub fn test_cluster_sync(mut output: DisjointSlice<u32>) {
         static mut SHMEM: SharedArray<u32, 1> = SharedArray::UNINIT;
 

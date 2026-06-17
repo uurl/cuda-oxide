@@ -44,7 +44,7 @@ use dialect_nvvm::ops::{
     CpAsyncBulkTensorS2gTile1dOp, CpAsyncBulkTensorS2gTile2dOp, CpAsyncBulkTensorS2gTile3dOp,
     CpAsyncBulkTensorS2gTile4dOp, CpAsyncBulkTensorS2gTile5dOp, CpAsyncBulkWaitGroupOp,
     CpAsyncBulkWaitGroupReadOp, CvtF16x2F32Op, CvtF32x2Bf16x2Op, DsmemReadU32Op,
-    FenceProxyAsyncSharedCtaOp, InlinePtxOp, MapaSharedClusterOp, MatchAllSyncI32Op,
+    FenceProxyAsyncSharedCtaOp, FmaBf16x2Op, InlinePtxOp, MapaSharedClusterOp, MatchAllSyncI32Op,
     MatchAllSyncI64Op, MatchAnySyncI32Op, MatchAnySyncI64Op, MbarrierArriveClusterOp,
     MbarrierArriveExpectTxSharedOp, MbarrierArriveSharedOp, MbarrierInitSharedOp,
     MbarrierInvalSharedOp, MbarrierTestWaitSharedOp, MbarrierTryWaitParitySharedOp,
@@ -2369,6 +2369,23 @@ impl MirToLlvmConversion for CvtF32x2Bf16x2Op {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::intrinsics::tcgen05::convert_cvt_f32x2_bf16x2(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for FmaBf16x2Op {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::bf16x2::convert_fma_bf16x2(
             ctx,
             rewriter,
             self.get_operation(),

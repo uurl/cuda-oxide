@@ -493,14 +493,22 @@ fn emit_pointer_cast(
             Ok(llvm::BitcastOp::new(ctx, val, llvm_ty).get_operation())
         }
     } else if src_is_int && dst_is_struct {
-        // Scalar -> aggregate Transmute with no niche encoding: we cannot
-        // safely guess the layout. Refuse loudly rather than fall through
-        // to an invalid bitcast.
-        pliron::input_err_noloc!(
-            "scalar -> aggregate Transmute without niche encoding; the importer did not \
-             classify this destination as a niche-optimised enum. Refusing to fall \
-             through to an invalid bitcast (see issue #21)."
-        )
+        // Scalar -> aggregate Transmute the importer did not classify as a
+        // niche-optimised enum (e.g. `usize -> NonNull<T>` from `core::fmt` /
+        // `core::ptr`). rustc guarantees the two have equal size, so lower it
+        // as a faithful memory round-trip through `emit_transmute_via_memory`,
+        // which checks size equality and stamps the natural alignment (an
+        // unguarded round-trip could silently move the wrong bytes). See #21.
+        //
+        // Scope note: we intentionally do NOT add the address-space-coercion
+        // cast variants (array->slice unsize, or thin-ptr->wrapper-field-0,
+        // over an `addrspace(3)` source). Those only arise for rust-gpu
+        // `#[spirv(workgroup)]` shared arrays; cuda-oxide has no such construct
+        // (its shared memory is `SharedArray`, which exposes no `&[T; N]` to
+        // unsize and no addrspace-3 slice), so there is no reachable trigger.
+        // And `std`-originated casts can never reach here at all: the collector
+        // rejects any `std::` call up front (device code is `core`/`alloc`-only).
+        emit_transmute_via_memory(ctx, rewriter, val, val_ty, llvm_ty)
     } else if src_is_struct && llvm_ty.deref(ctx).is::<IntegerType>() {
         emit_struct_to_scalar(ctx, rewriter, val, val_ty, llvm_ty)
     } else if src_is_array || dst_is_array {

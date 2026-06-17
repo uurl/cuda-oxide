@@ -109,6 +109,17 @@ pub(crate) fn debug_value_for_promoted_slot(
         return None;
     }
 
+    // A load-before-store of a debug-tagged slot reaches promotion with the
+    // synthesized `undef` default-def (mem2reg's get_or_create_default_def).
+    // Recording `dbg.value(undef, var)` would tell the debugger the local is
+    // poison at a point the source may still treat as live, so skip it; the
+    // declaration metadata copied below already describes the variable.
+    if let Some(def) = value.defining_op()
+        && Operation::get_opid(def, ctx) == crate::ops::constants::MirUndefOp::get_opid_static()
+    {
+        return None;
+    }
+
     let dbg_value = MirDbgValueOp::new(ctx, value);
     copy_debug_local_attrs(ctx, slot_op, dbg_value.get_operation());
     stamp_declaration_location(ctx, slot_op, dbg_value.get_operation());

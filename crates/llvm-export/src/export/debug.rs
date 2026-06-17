@@ -228,6 +228,12 @@ impl<'a> ModuleExportState<'a> {
 
         let parent = source_scope_data
             .parent
+            // rustc emits SourceScopes as a tree in which every parent precedes
+            // its child (parent id < child id). Requiring that here matches the
+            // real invariant and guarantees termination: a malformed map with a
+            // cyclic or forward parent link degrades to the function scope
+            // instead of recursing without bound.
+            .filter(|&parent| parent < source_scope)
             .and_then(|parent| self.resolve_debug_source_scope(function_scope, parent))
             .unwrap_or(ResolvedDebugScope {
                 scope: function_scope,
@@ -663,7 +669,10 @@ fn source_scope_depth(map: &crate::ops::DebugSourceScopeMap, scope: u32) -> usiz
             break;
         };
         depth += 1;
-        current = data.parent;
+        // Parents always precede their child in a well-formed rustc scope tree;
+        // only follow strictly-smaller ids so a malformed cyclic map cannot
+        // spin here forever.
+        current = data.parent.filter(|&parent| parent < scope_id);
     }
 
     depth

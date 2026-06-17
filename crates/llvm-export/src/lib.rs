@@ -392,6 +392,18 @@ pub mod ops {
         op: Ptr<Operation>,
         map: &DebugSourceScopeMap,
     ) {
+        // The reader (`debug_source_scope_map`) reconstructs scope ids as
+        // `0..count`, so the writer's per-scope attr keys must use exactly those
+        // ids. rustc's `SourceScope` indices are dense `0..len`, which makes this
+        // hold today. Assert it so a future sparse/reordered producer fails
+        // loudly here instead of silently mislabeling parent/scope links.
+        debug_assert!(
+            map.scopes
+                .iter()
+                .enumerate()
+                .all(|(idx, scope)| scope.id as usize == idx),
+            "DebugSourceScopeMap scope ids must be dense 0..len to round-trip"
+        );
         set_string_attr(
             ctx,
             op,

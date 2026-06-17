@@ -327,7 +327,7 @@ fn debug_type_for_ty_at(ty: &Ty, depth: usize) -> Option<DebugLocalTypeKind> {
             let fields = subtypes
                 .iter()
                 .enumerate()
-                .map(|(idx, sub)| (format!("__{idx}"), sub.clone()));
+                .map(|(idx, sub)| (format!("__{idx}"), *sub));
             debug_struct_type(ty, name, fields, depth)
         }
         TyKind::RigidTy(RigidTy::Adt(adt_def, substs)) if depth < MAX_DEBUG_TYPE_DEPTH => {

@@ -43,6 +43,32 @@ mod kernels {
         }
     }
 
+    /// Original repro from issue #232: 2D scratch buffer with a row assignment.
+    ///
+    /// scratch = [[0.0; 2]; 4]  (nested repeat aggregate)
+    /// scratch[2] = [0.0, 42.0]  (row store: array aggregate into indexed slot)
+    /// out[0] = scratch[2][1]   (read back)
+    ///
+    /// Before the fix, the IR contained an `insertvalue` chain building a full
+    /// `[4 x [2 x double]]` SSA value before storing it; with the fix each
+    /// element is stored directly into the alloca.
+    #[kernel]
+    pub fn scratch_2d(mut out: DisjointSlice<f64>) {
+        let idx = thread::index_1d();
+        if idx.get() != 0 {
+            return;
+        }
+
+        const ROWS: usize = 4;
+        const COLS: usize = 2;
+        let mut scratch = [[0.0_f64; COLS]; ROWS];
+        scratch[2] = [0.0, 42.0];
+
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = scratch[2][1];
+        }
+    }
+
     /// Same but with a repeat expression: [0u32; 8].
     #[kernel]
     #[allow(clippy::needless_range_loop)]
@@ -112,6 +138,22 @@ fn main() {
             }
             errors += 1;
         }
+    }
+
+    // --- scratch_2d ---
+    // scratch[2] = [0.0, 42.0]; out[0] = scratch[2][1]  => 42.0
+    let mut out_dev = DeviceBuffer::<f64>::zeroed(&stream, 1).unwrap();
+    module
+        .scratch_2d(
+            &stream,
+            LaunchConfig::for_num_elems(1),
+            &mut out_dev,
+        )
+        .expect("scratch_2d launch");
+    let out3 = out_dev.to_host_vec(&stream).unwrap();
+    if (out3[0] - 42.0_f64).abs() > 1e-12 {
+        eprintln!("  FAIL scratch_2d: got {} want 42.0", out3[0]);
+        errors += 1;
     }
 
     if errors == 0 {

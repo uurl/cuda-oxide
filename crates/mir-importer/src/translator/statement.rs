@@ -42,13 +42,13 @@ use dialect_mir::ops::{MirMemcpyOp, MirStorageDeadOp, MirStorageLiveOp, MirStore
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
-use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::Typed;
 use pliron::utils::apint::APInt;
 use pliron::value::Value;
+use pliron::{input_err, input_error};
 use rustc_public::mir;
 use std::num::NonZeroUsize;
 
@@ -70,15 +70,32 @@ pub fn translate_statement(
 
     match &stmt.kind {
         mir::StatementKind::Assign(place, rvalue) => {
-            // Fast path: array aggregate assigned to an addressable local.
-            // Write each element directly into the alloca storage instead of
+            // Fast paths: array initializers assigned to an addressable local.
+            // Store each element directly into the alloca storage instead of
             // building an SSA aggregate (insertvalue chain) and then storing it.
-            if let mir::Rvalue::Aggregate(mir::AggregateKind::Array(_), operands) = rvalue
-                && value_map.get_slot(place.local).is_some()
-            {
-                return translate_array_agg_into_alloca(
-                    ctx, body, place, operands, value_map, block_ptr, prev_op, loc,
-                );
+            if value_map.get_slot(place.local).is_some() {
+                match rvalue {
+                    mir::Rvalue::Aggregate(mir::AggregateKind::Array(_), operands) => {
+                        return translate_array_agg_into_alloca(
+                            ctx, body, place, operands, value_map, block_ptr, prev_op, loc,
+                        );
+                    }
+                    mir::Rvalue::Repeat(operand, count) => {
+                        let n = count.eval_target_usize().map_err(|e| {
+                            input_error!(
+                                loc.clone(),
+                                TranslationErr::unsupported(format!(
+                                    "Failed to evaluate Repeat count: {:?}",
+                                    e
+                                ))
+                            )
+                        })? as usize;
+                        return translate_repeat_into_alloca(
+                            ctx, body, place, operand, n, value_map, block_ptr, prev_op, loc,
+                        );
+                    }
+                    _ => {}
+                }
             }
 
             // Translate the Rvalue to get the value being assigned
@@ -1012,6 +1029,66 @@ fn pointer_address_space(ctx: &pliron::context::Context, ptr: Value) -> u32 {
 
 /// Assign an array aggregate element-by-element into addressable storage.
 ///
+/// Handles `Rvalue::Repeat(operand, N)` assigned to an addressable local.
+///
+/// Translates the operand once and stores N copies directly into the alloca
+/// via ConstantIndex projections. Avoids building a full SSA aggregate and the
+/// resulting `insertvalue` chain in LLVM IR.
+fn translate_repeat_into_alloca(
+    ctx: &mut Context,
+    body: &mir::Body,
+    dest_place: &mir::Place,
+    operand: &mir::Operand,
+    count: usize,
+    value_map: &mut ValueMap,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<Option<Ptr<Operation>>> {
+    let (elem_val, after_operand) = rvalue::translate_operand(
+        ctx,
+        body,
+        operand,
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let mut current_prev = after_operand.or(prev_op);
+
+    for i in 0..count {
+        let elem_place = mir::Place {
+            local: dest_place.local,
+            projection: dest_place
+                .projection
+                .iter()
+                .cloned()
+                .chain(std::iter::once(mir::ProjectionElem::ConstantIndex {
+                    offset: i as u64,
+                    min_length: count as u64,
+                    from_end: false,
+                }))
+                .collect(),
+        };
+
+        let after_store = store_through_place_address(
+            ctx,
+            body,
+            value_map,
+            &elem_place,
+            elem_val,
+            None,
+            current_prev,
+            current_prev,
+            block_ptr,
+            loc.clone(),
+        )?;
+        current_prev = after_store.or(current_prev);
+    }
+
+    Ok(current_prev)
+}
+
 /// When the destination has an alloca slot and the RHS is
 /// `Rvalue::Aggregate(Array, operands)`, building a full SSA aggregate
 /// (`MirConstructArrayOp`) followed by a single large store produces a chain

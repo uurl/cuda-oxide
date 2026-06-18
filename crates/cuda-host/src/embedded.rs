@@ -60,6 +60,63 @@ pub fn load_embedded_module(
     load_bundle(ctx, &bundle)
 }
 
+/// Merge all PTX bundles from the current executable into a single CUDA module.
+///
+/// When a generic kernel is monomorphized in a consuming crate, its PTX ends
+/// up in that crate's bundle rather than the defining crate's bundle. This
+/// function gathers every PTX bundle in the binary, strips duplicate header
+/// directives (`.version`, `.target`, `.address_size`) from all but the first
+/// bundle, concatenates the bodies, and loads the result as one CUDA module.
+/// All kernel symbols are therefore available regardless of which crate bundle
+/// they were compiled into.
+///
+/// Bundles with non-PTX payloads (NVVM IR, LTOIR, cubin) are skipped; use
+/// `load_embedded_module` for those.
+pub fn load_all_ptx_bundles_merged(
+    ctx: &Arc<CudaContext>,
+) -> Result<Arc<CudaModule>, EmbeddedModuleError> {
+    let bundles = artifact_bundles_from_current_exe()?;
+
+    let mut merged = String::new();
+    let mut found_any = false;
+
+    for bundle in &bundles {
+        if let Some(ptx_bytes) = bundle.payload(ArtifactPayloadKind::Ptx) {
+            let ptx_str = std::str::from_utf8(ptx_bytes)
+                .map_err(|_| EmbeddedModuleError::UnsupportedPayload {
+                    name: bundle.name.clone(),
+                })?
+                .trim_end_matches('\0');
+
+            if !found_any {
+                merged.push_str(ptx_str);
+                merged.push('\n');
+                found_any = true;
+            } else {
+                // Strip per-file header directives; only one set is valid in a
+                // concatenated PTX module.
+                for line in ptx_str.lines() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with(".version")
+                        || trimmed.starts_with(".target")
+                        || trimmed.starts_with(".address_size")
+                    {
+                        continue;
+                    }
+                    merged.push_str(line);
+                    merged.push('\n');
+                }
+            }
+        }
+    }
+
+    if !found_any {
+        return Err(EmbeddedModuleError::NoModules);
+    }
+
+    Ok(ctx.load_module_from_image(merged.as_bytes())?)
+}
+
 /// Load the first embedded artifact bundle with a supported payload.
 pub fn load_first_embedded_module(
     ctx: &Arc<CudaContext>,

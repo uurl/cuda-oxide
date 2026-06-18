@@ -291,6 +291,21 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
     });
 
     let artifact_anchor_statements = cuda_module_artifact_anchor_statements(&kernels)?;
+    let has_generic = kernels.iter().any(|k| k.is_generic);
+    let module_loader = if has_generic {
+        // At least one kernel is generic: its PTX is emitted into the
+        // consuming binary's bundle, not this crate's bundle. Merge all
+        // PTX bundles from the executable so generic monomorphizations are
+        // visible regardless of which crate compiled them.
+        quote! {
+            let _ = name; // merged load ignores the crate-name hint
+            let module = ::cuda_host::load_all_ptx_bundles_merged(ctx)?;
+        }
+    } else {
+        quote! {
+            let module = ::cuda_host::load_embedded_module(ctx, name)?;
+        }
+    };
     let constant_fields = constants.iter().map(generate_cuda_module_constant_field);
     let constant_initializers = constants
         .iter()
@@ -362,7 +377,7 @@ fn expand_cuda_module(module: ItemMod) -> syn::Result<TokenStream2> {
                 name: &str,
             ) -> ::core::result::Result<LoadedModule, ::cuda_host::EmbeddedModuleError> {
                 #artifact_anchor_statements
-                let module = ::cuda_host::load_embedded_module(ctx, name)?;
+                #module_loader
                 from_module(module).map_err(::cuda_host::EmbeddedModuleError::Driver)
             }
 

@@ -7,7 +7,7 @@
 //! from `sm_80`, so the FMA op is what we expose; on Ampere, packed add can
 //! be expressed by the caller as `fma(a, ONE_BF16X2, b)`.
 
-use llvm_export::ops as llvm;
+use llvm_export::ops::{self as llvm, AsmKind, InlineAsmOpExt};
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
@@ -37,13 +37,13 @@ pub(crate) fn convert_fma_bf16x2(
 
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
 
-    let inline_asm = llvm::InlineAsmOp::new(
+    let inline_asm = llvm::InlineAsmOp::build(
         ctx,
         i32_ty.into(),
         vec![a_val, b_val, c_val],
         "fma.rn.bf16x2 $0, $1, $2, $3;",
         "=r,r,r,r",
-        false,
+        AsmKind::Pure,
     );
 
     let asm_op = inline_asm.get_operation();

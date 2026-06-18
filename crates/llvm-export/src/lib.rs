@@ -248,10 +248,6 @@ pub mod ops {
         }
     }
 
-    /// Query the [`AsmKind`] stored on an `InlineAsmOp`.
-    ///
-    /// Returns `AsmKind::SideEffect` if the attribute is missing (safe default:
-    /// assume side effects).
     /// Query the [`AsmKind`] stored on an `InlineAsmOp`, if present.
     ///
     /// Returns `None` for ops that were not built with [`InlineAsmOpExt::build`]

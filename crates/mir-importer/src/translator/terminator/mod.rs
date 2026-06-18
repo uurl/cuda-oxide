@@ -3352,24 +3352,28 @@ fn try_dispatch_intrinsic(
             )?))
         }
 
-        // DisjointSlice methods using prefix matching
+        // DisjointSlice methods using prefix matching (covers generic
+        // instantiations whose full path includes type parameters).
+        // Note: `get_mut` and `get_unchecked_mut` are `#[inline]` in
+        // cuda-device and are always inlined by rustc before MIR reaches the
+        // translator. Routing them here would produce a type mismatch
+        // (`emit_get_thread_local` returns `*mut T` but `get_mut` returns
+        // `Option<&mut T>`). They are intentionally absent from this match.
         path if path.starts_with("cuda_device::DisjointSlice::") => {
             if let Some(method) = path.rsplit("::").next() {
                 match method {
-                    "get_mut" | "get_unchecked_mut" | "get_thread_local" => {
-                        Ok(Some(intrinsics::indexing::emit_get_thread_local(
-                            ctx,
-                            body,
-                            args,
-                            destination,
-                            target,
-                            block_ptr,
-                            prev_op,
-                            value_map,
-                            block_map,
-                            loc,
-                        )?))
-                    }
+                    "get_thread_local" => Ok(Some(intrinsics::indexing::emit_get_thread_local(
+                        ctx,
+                        body,
+                        args,
+                        destination,
+                        target,
+                        block_ptr,
+                        prev_op,
+                        value_map,
+                        block_map,
+                        loc,
+                    )?)),
                     "len" => Ok(Some(intrinsics::indexing::emit_len(
                         ctx,
                         body,

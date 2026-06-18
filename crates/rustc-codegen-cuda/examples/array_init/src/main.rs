@@ -144,11 +144,7 @@ fn main() {
     // scratch[2] = [0.0, 42.0]; out[0] = scratch[2][1]  => 42.0
     let mut out_dev = DeviceBuffer::<f64>::zeroed(&stream, 1).unwrap();
     module
-        .scratch_2d(
-            &stream,
-            LaunchConfig::for_num_elems(1),
-            &mut out_dev,
-        )
+        .scratch_2d(&stream, LaunchConfig::for_num_elems(1), &mut out_dev)
         .expect("scratch_2d launch");
     let out3 = out_dev.to_host_vec(&stream).unwrap();
     if (out3[0] - 42.0_f64).abs() > 1e-12 {

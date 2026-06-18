@@ -1,0 +1,122 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Array literal initialization smoke test (issue #232).
+//!
+//! Verifies that array literals assigned to addressable locals compile and
+//! produce correct results. Before the fix, `let arr = [v0, v1, v2, v3]`
+//! inside a kernel would crash because the translator tried to build a full
+//! SSA aggregate for an array type, which is not a first-class SSA value.
+//!
+//! The kernel initializes a `[u32; 4]` array literal, modifies one element,
+//! then sums all elements. The host checks the expected sum.
+//!
+//! Run: cargo oxide run array_init
+
+use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_host::cuda_module;
+
+#[cuda_module]
+mod kernels {
+    use super::*;
+
+    /// Initializes a fixed array literal and sums its elements.
+    ///
+    /// arr = [1, 2, 3, 4]  (literal initialization into an alloca slot)
+    /// arr[2] += thread_index  (dynamic modification to keep the array live)
+    /// out[i] = arr[0] + arr[1] + arr[2] + arr[3]
+    #[kernel]
+    pub fn array_sum(mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+
+        // Array literal: exercises Aggregate(Array, ...) into an alloca.
+        let mut arr = [1u32, 2, 3, 4];
+
+        // Prevent the array from being optimized away.
+        arr[2] += idx.get() as u32;
+
+        if let Some(o) = out.get_mut(idx) {
+            *o = arr[0] + arr[1] + arr[2] + arr[3];
+        }
+    }
+
+    /// Same but with a repeat expression: [0u32; 8].
+    #[kernel]
+    pub fn zeroed_array_sum(mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        let i = idx.get() as u32;
+
+        let mut arr = [0u32; 8];
+        for k in 0..8usize {
+            arr[k] = i + k as u32;
+        }
+
+        let mut sum = 0u32;
+        for k in 0..8usize {
+            sum += arr[k];
+        }
+
+        if let Some(o) = out.get_mut(idx) {
+            *o = sum;
+        }
+    }
+}
+
+fn main() {
+    const N: usize = 256;
+
+    let ctx = CudaContext::new(0).expect("CUDA context");
+    let stream = ctx.default_stream();
+    let module = kernels::load(&ctx).expect("load module");
+    let cfg = LaunchConfig::for_num_elems(N as u32);
+
+    // --- array_sum ---
+    // arr = [1, 2, 3, 4]; arr[2] += i; sum = 1 + 2 + (3 + i) + 4 = 10 + i
+    let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    module
+        .array_sum(&stream, cfg, &mut out_dev)
+        .expect("array_sum launch");
+    let out = out_dev.to_host_vec(&stream).unwrap();
+
+    let mut errors = 0usize;
+    for i in 0..N {
+        let expected = 10 + i as u32;
+        if out[i] != expected {
+            if errors < 5 {
+                eprintln!("  FAIL array_sum[{}]: got {} want {}", i, out[i], expected);
+            }
+            errors += 1;
+        }
+    }
+
+    // --- zeroed_array_sum ---
+    // arr[k] = i + k; sum = sum_{k=0}^{7}(i + k) = 8i + 28
+    let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+    module
+        .zeroed_array_sum(&stream, cfg, &mut out_dev)
+        .expect("zeroed_array_sum launch");
+    let out2 = out_dev.to_host_vec(&stream).unwrap();
+
+    for i in 0..N {
+        let expected = 8 * i as u32 + 28;
+        if out2[i] != expected {
+            if errors < 5 {
+                eprintln!(
+                    "  FAIL zeroed_array_sum[{}]: got {} want {}",
+                    i, out2[i], expected
+                );
+            }
+            errors += 1;
+        }
+    }
+
+    if errors == 0 {
+        println!("SUCCESS: array literal initialization produces correct results");
+    } else {
+        eprintln!("FAIL: {} errors", errors);
+        std::process::exit(1);
+    }
+}

@@ -22,8 +22,8 @@
 use crate::error::{DeviceError, device_assert, device_error};
 use crate::scheduling_policies::{GlobalSchedulingPolicy, SchedulingPolicy, StreamPoolRoundRobin};
 use cuda_core::{CudaContext, CudaFunction, CudaModule, CudaStream};
-use std::cell::Cell;
 use rustc_hash::FxHashMap;
+use std::cell::Cell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 

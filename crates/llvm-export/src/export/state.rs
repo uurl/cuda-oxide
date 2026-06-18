@@ -86,7 +86,8 @@ pub(super) struct ModuleExportState<'a> {
     /// `DIType` nodes keyed by the simple debug type they describe.
     pub(super) debug_types: FxHashMap<DebugLocalTypeKind, usize>,
     /// `DILocalVariable` nodes keyed by scope, source line, and local identity.
-    pub(super) debug_local_variables: FxHashMap<(usize, PathBuf, i32, DebugLocalVariableInfo), usize>,
+    pub(super) debug_local_variables:
+        FxHashMap<(usize, PathBuf, i32, DebugLocalVariableInfo), usize>,
     /// Numbered debug metadata definitions, in allocation order.
     pub(super) debug_nodes: Vec<(usize, String)>,
     /// Whether any function emitted `llvm.dbg.declare`.

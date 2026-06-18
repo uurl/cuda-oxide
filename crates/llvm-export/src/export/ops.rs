@@ -5,8 +5,8 @@
 
 //! Operation emission for LLVM IR.
 
-use std::cell::Ref;
 use rustc_hash::FxHashMap;
+use std::cell::Ref;
 use std::fmt::Write;
 
 use pliron::r#type::Typed;

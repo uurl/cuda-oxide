@@ -1014,7 +1014,7 @@ mod tests {
     use dialect_mir::ops as mir;
     use dialect_mir::types::MirPtrType;
     use llvm_export::ops as llvm;
-    use pliron::builtin::op_interfaces::SymbolOpInterface;
+    use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpInterface};
     use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
     use pliron::context::{Context, Ptr};
     use pliron::linked_list::ContainsLinkedList;
@@ -1128,6 +1128,18 @@ mod tests {
         let module_ptr = lower_single_cast(&mut ctx, f32_ty, i32_ty, MirCastKindAttr::FloatToInt);
 
         assert_cast_lowered_to::<llvm::CallOp>(&ctx, module_ptr, "llvm.call");
+        let calls = find_all::<llvm::CallOp>(&ctx, &kernel_blocks(&ctx, module_ptr));
+        let [call] = calls.as_slice() else {
+            panic!("f32 -> i32 signed cast must lower to exactly one llvm.call");
+        };
+        let CallOpCallable::Direct(callee) = call.callee(&ctx) else {
+            panic!("f32 -> i32 signed cast must use a direct intrinsic call");
+        };
+        assert_eq!(
+            callee.to_string(),
+            "llvm_fptosi_sat_i32_f32",
+            "f32 -> i32 signed cast must call llvm_fptosi_sat_i32_f32"
+        );
         assert!(
             module_has_llvm_func(&ctx, module_ptr, "llvm_fptosi_sat_i32_f32"),
             "f32 -> i32 signed cast must declare llvm_fptosi_sat_i32_f32"

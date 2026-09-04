@@ -10,7 +10,9 @@ use super::common::{
     pointer_proved_alignment, value_abi_align, value_mir_type,
 };
 use super::debug::copy_debug_local_variable;
+use crate::convert::target_stable_storage::coerce_target_stable_value;
 use crate::convert::types::{convert_type, mir_type_abi_align};
+use crate::packed_shared_local_storage::carrier_storage_type;
 use dialect_mir::types::MirPtrType;
 use llvm_export::ops as llvm;
 use pliron::builtin::types::{IntegerType, Signedness};
@@ -43,16 +45,31 @@ pub(crate) fn convert_store(
         }
     };
 
-    // Packed whole-value stores are byte-faithful now that divergent rustc
-    // layouts lower to LLVM packed structs. Keep the target-dependent AS3 case
-    // fail-closed because its physical pointer width is selected only later.
-    fail_on_target_dependent_packed_aggregate(
-        ctx,
-        value_mir_type(ctx, operands_info, val),
-        "storing",
-    )?;
+    let stored_val = if let Some(storage_ty) = carrier_storage_type(ctx, op) {
+        // Carrier identity was proven on MIR before conversion. Convert exactly
+        // at the memory boundary; never rediscover storage provenance from the
+        // converted pointer or its defining operation.
+        coerce_target_stable_value(
+            ctx,
+            rewriter,
+            val,
+            storage_ty,
+            "packed shared carrier-local store",
+        )?
+    } else {
+        // Packed whole-value stores are byte-faithful now that divergent rustc
+        // layouts lower to LLVM packed structs. Keep the target-dependent AS3
+        // case fail-closed for arbitrary memory; only pre-proven carrier-local
+        // accesses are exempt.
+        fail_on_target_dependent_packed_aggregate(
+            ctx,
+            value_mir_type(ctx, operands_info, val),
+            "storing",
+        )?;
+        val
+    };
 
-    let llvm_store = llvm::StoreOp::new(ctx, val, ptr);
+    let llvm_store = llvm::StoreOp::new(ctx, stored_val, ptr);
     if dialect_mir::ops::MirStoreOp::new(op).is_volatile(ctx) {
         llvm_export::ops::set_op_volatile(ctx, llvm_store.get_operation(), true);
     }
@@ -92,15 +109,19 @@ pub(crate) fn convert_load(
 ) -> Result<()> {
     let ptr = op.deref(ctx).get_operand(0);
     let result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    let semantic_llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
 
-    // Packed whole-value loads are byte-faithful now that divergent rustc
-    // layouts lower to LLVM packed structs. Keep only the target-dependent AS3
-    // physical-image case fail-closed.
-    fail_on_target_dependent_packed_aggregate(ctx, result_ty, "loading")?;
+    let storage_ty = if let Some(storage_ty) = carrier_storage_type(ctx, op) {
+        storage_ty
+    } else {
+        // Packed whole-value loads are byte-faithful now that divergent rustc
+        // layouts lower to LLVM packed structs. Keep only the target-dependent
+        // AS3 physical-image case fail-closed for arbitrary memory.
+        fail_on_target_dependent_packed_aggregate(ctx, result_ty, "loading")?;
+        semantic_llvm_ty
+    };
 
-    let llvm_ty = convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?;
-
-    let llvm_load = llvm::LoadOp::new(ctx, ptr, llvm_ty);
+    let llvm_load = llvm::LoadOp::new(ctx, ptr, storage_ty);
     if dialect_mir::ops::MirLoadOp::new(op).is_volatile(ctx) {
         llvm_export::ops::set_op_volatile(ctx, llvm_load.get_operation(), true);
     }
@@ -123,7 +144,20 @@ pub(crate) fn convert_load(
         llvm_export::ops::set_op_alignment(ctx, llvm_load.get_operation(), align as u32);
     }
     rewriter.insert_operation(ctx, llvm_load.get_operation());
-    rewriter.replace_operation(ctx, op, llvm_load.get_operation());
+
+    if storage_ty == semantic_llvm_ty {
+        rewriter.replace_operation(ctx, op, llvm_load.get_operation());
+    } else {
+        let physical_value = llvm_load.get_operation().deref(ctx).get_result(0);
+        let semantic_value = coerce_target_stable_value(
+            ctx,
+            rewriter,
+            physical_value,
+            semantic_llvm_ty,
+            "packed shared carrier-local load",
+        )?;
+        rewriter.replace_operation_with_values(ctx, op, vec![semantic_value]);
+    }
 
     Ok(())
 }
@@ -154,7 +188,10 @@ pub(crate) fn convert_alloca(
         })?;
         mir_ptr.pointee
     };
-    let llvm_pointee = convert_type(ctx, mir_pointee).map_err(anyhow_to_pliron)?;
+    let llvm_pointee = match carrier_storage_type(ctx, op) {
+        Some(storage_ty) => storage_ty,
+        None => convert_type(ctx, mir_pointee).map_err(anyhow_to_pliron)?,
+    };
 
     let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
     let one_apint =

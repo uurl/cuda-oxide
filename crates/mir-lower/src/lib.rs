@@ -128,6 +128,7 @@ pub mod conversion_interface;
 pub mod convert;
 pub mod helpers;
 pub mod lowering;
+mod packed_shared_local_storage;
 pub mod scalarize_block_args;
 pub mod type_conversion_interface;
 mod wgmma_deferred_accumulator;
@@ -391,6 +392,11 @@ pub fn lower_mir_to_llvm_with_options(
     // every kernel-to-helper requirement while the complete MIR call graph is
     // still available; function conversion removes that graph incrementally.
     lowering::propagate_kernel_dynamic_shared_alignments(ctx, module_op);
+    // Prove the complete address-use path for every narrow packed-AS3 carrier
+    // local immediately before conversion. The resulting per-op TypeAttrs are
+    // lowering capabilities, not inferred provenance: calls, block arguments,
+    // casts, nested projections, returns, and unknown uses fail closed here.
+    packed_shared_local_storage::prepare_packed_shared_local_storage(ctx, module_op)?;
     let mut conversion = MirToLlvmConversionDriver {
         shared_globals: FxHashMap::default(),
         device_globals: FxHashMap::default(),

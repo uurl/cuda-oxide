@@ -275,11 +275,7 @@ fn through_deref_field(_1: *mut (u64, u32), _2: u32) {
 /// `RET[i].1 = double_it(x)`: Index -> Field chain.
 #[custom_mir(dialect = "runtime", phase = "initial")]
 #[inline(never)]
-fn through_index_field(
-    mut _1: usize,
-    _2: u32,
-    _3: [(u64, u32); 2],
-) -> [(u64, u32); 2] {
+fn through_index_field(mut _1: usize, _2: u32, _3: [(u64, u32); 2]) -> [(u64, u32); 2] {
     mir! {
         type RET = [(u64, u32); 2];
         {

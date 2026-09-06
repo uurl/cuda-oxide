@@ -10,7 +10,7 @@ use mir::serialize::Serialize;
 use mir::syntax::{
     AggregateKind, BasicBlock, BasicBlockData, BinOp, Body, Callee, Function, IntTy, Literal,
     Local, LocalDecls, Mutability, Operand, Place, Program, ProjectionElem, Rvalue, Statement,
-    SwitchTargets, Terminator, TyId, TyKind, UnOp, VariantIdx,
+    Static, StaticDecl, SwitchTargets, Terminator, TyId, TyKind, UnOp, VariantIdx,
 };
 use mir::tyctxt::TyCtxt;
 use rand::{Rng, RngCore, SeedableRng, seq::IteratorRandom};
@@ -107,6 +107,30 @@ impl GenerationCtx {
             }
         })
     }
+
+    fn choose_static_operand(&self, ty: TyId) -> Result<Operand> {
+        let candidates = self
+            .program
+            .statics
+            .iter_enumerated()
+            .filter_map(|(id, decl)| match ty.kind(&self.tcx) {
+                TyKind::Ref(pointee, Mutability::Not)
+                    if decl.mutability == Mutability::Not && decl.ty == *pointee =>
+                {
+                    Some(Operand::Static(id, ty))
+                }
+                TyKind::RawPtr(pointee, Mutability::Mut)
+                    if decl.mutability == Mutability::Mut && decl.ty == *pointee =>
+                {
+                    Some(Operand::StaticMut(id, ty))
+                }
+                _ => None,
+            });
+
+        candidates
+            .choose(&mut *self.rng.borrow_mut())
+            .ok_or(SelectionError::Exhausted)
+    }
 }
 
 // Rvalue
@@ -122,7 +146,18 @@ impl GenerationCtx {
             lhs.serialize_value(&self.tcx),
             lhs.ty(self.current_decls(), &self.tcx).serialize(&self.tcx)
         );
-        let operand = self.choose_operand(&[lhs.ty(self.current_decls(), &self.tcx)], lhs)?;
+        let ty = lhs.ty(self.current_decls(), &self.tcx);
+        let operand = if self.program.statics.is_empty() {
+            self.choose_operand(&[ty], lhs)?
+        } else {
+            self.make_choice([false, true].into_iter(), |use_static| {
+                if use_static {
+                    self.choose_static_operand(ty)
+                } else {
+                    self.choose_operand(&[ty], lhs)
+                }
+            })?
+        };
         Ok(Rvalue::Use(operand))
     }
 
@@ -870,12 +905,70 @@ impl GenerationCtx {
         self.enter_bb(bb);
     }
 
+    fn insert_static_mut_workload(&mut self) {
+        if self.program.statics.is_empty() || self.cursor.function.index() != 0 {
+            return;
+        }
+
+        let mutable_statics: Vec<(Static, TyId)> = self
+            .program
+            .statics
+            .iter_enumerated()
+            .filter_map(|(id, decl)| (decl.mutability == Mutability::Mut).then_some((id, decl.ty)))
+            .collect();
+        let Some(&(static_id, pointee_ty)) =
+            mutable_statics.iter().choose(&mut *self.rng.borrow_mut())
+        else {
+            return;
+        };
+
+        let pointer_ty = self
+            .tcx
+            .iter_enumerated()
+            .find_map(|(ty, kind)| match kind {
+                TyKind::RawPtr(pointee, Mutability::Mut) if *pointee == pointee_ty => Some(ty),
+                _ => None,
+            })
+            .expect("mutable static pointee has a matching raw pointer type");
+
+        let pointer_local = self.declare_new_var(Mutability::Mut, pointer_ty);
+        let before_local = self.declare_new_var(Mutability::Mut, pointee_ty);
+        let after_local = self.declare_new_var(Mutability::Mut, pointee_ty);
+
+        let pointer = Place::from_local(pointer_local);
+        let mut pointee = pointer.clone();
+        pointee.project(ProjectionElem::Deref);
+        let before = Place::from_local(before_local);
+        let after = Place::from_local(after_local);
+        let write_value = self
+            .rng
+            .borrow_mut()
+            .gen_literal(pointee_ty, &self.tcx)
+            .expect("static pointee type is literalble");
+
+        let statements = [
+            Statement::Assign(
+                pointer.clone(),
+                Rvalue::Use(Operand::StaticMut(static_id, pointer_ty)),
+            ),
+            Statement::Assign(before, Rvalue::Use(Operand::Copy(pointee.clone()))),
+            Statement::Assign(pointee.clone(), Rvalue::Use(Operand::Constant(write_value))),
+            Statement::Assign(after, Rvalue::Use(Operand::Copy(pointee))),
+        ];
+
+        for statement in statements {
+            self.post_generation(&statement);
+            self.current_bb_mut().insert_statement(statement);
+        }
+    }
+
     // Generate a Return terminator, returns false if it's being
     // generated in fn0
     fn add_return(&mut self) -> bool {
         trace!("generating a Return terminator to {:?}", self.cursor);
         debug_assert!(self.pt.can_return());
 
+        self.insert_static_mut_workload();
         self.insert_dump_var_gadget();
 
         self.current_bb_mut().set_terminator(Terminator::Return);
@@ -1152,17 +1245,59 @@ impl GenerationCtx {
 
     pub fn new(config: Config, seed: u64, debug_dump: bool) -> Self {
         let rng = RefCell::new(Box::new(rand::rngs::SmallRng::seed_from_u64(seed)));
+        let static_count = config.generation.static_count;
         let mut tcx = TyCtxt::from_primitives(config.ty);
         seed_tys(&mut tcx, &mut *rng.borrow_mut());
         let tcx = Rc::new(tcx);
         let ty_weights = TySelect::new(&tcx);
+        let mut program = Program::new(debug_dump);
+        let mut pt = PlaceGraph::new(tcx.clone());
+
+        // Keep the default-zero path byte-for-byte reproducible: do not even
+        // draw from the RNG unless static generation is explicitly enabled.
+        if static_count > 0 {
+            let static_specs: Vec<(TyId, Mutability)> = tcx
+                .indices()
+                .filter_map(|ty| match ty.kind(&tcx) {
+                    TyKind::Ref(pointee, Mutability::Not)
+                        if <dyn RngCore>::is_literalble(*pointee, &tcx) =>
+                    {
+                        Some((*pointee, Mutability::Not))
+                    }
+                    TyKind::RawPtr(pointee, Mutability::Mut)
+                        if <dyn RngCore>::is_literalble(*pointee, &tcx) =>
+                    {
+                        Some((*pointee, Mutability::Mut))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            for _ in 0..static_count {
+                let Some(&(ty, mutability)) = static_specs.iter().choose(&mut *rng.borrow_mut())
+                else {
+                    break;
+                };
+                let init = rng
+                    .borrow_mut()
+                    .gen_literal(ty, &tcx)
+                    .expect("static pointee type is literalble");
+                let id = program.push_static(StaticDecl {
+                    ty,
+                    mutability,
+                    init,
+                });
+                pt.allocate_static(id, ty, init);
+            }
+        }
+
         // TODO: don't zero-initialize current_function and current_bb
         Self {
             rng,
             tcx: tcx.clone(),
             ty_weights,
-            program: Program::new(debug_dump),
-            pt: PlaceGraph::new(tcx.clone()),
+            program,
+            pt,
             return_stack: vec![],
             cursor: Cursor {
                 function: Function::new(0),
@@ -1340,6 +1475,12 @@ impl GenerationCtx {
                                 pt.assign_literal(lhs, Some(*lit));
                             }));
                         }
+                        Operand::Static(id, _) | Operand::StaticMut(id, _) => {
+                            let static_place = self.pt.static_place(*id);
+                            actions.push(Box::new(move |pt| {
+                                pt.set_ref(lhs, static_place, None);
+                            }));
+                        }
                     },
                     agg @ Rvalue::Aggregate(agg_kind, ..) => {
                         if self.pt.ty(lhs).kind(&self.tcx).is_enum() {
@@ -1361,6 +1502,12 @@ impl GenerationCtx {
                                 Operand::Constant(lit) => {
                                     actions.push(Box::new(move |pt| {
                                         pt.assign_literal(target, Some(*lit));
+                                    }));
+                                }
+                                Operand::Static(id, _) | Operand::StaticMut(id, _) => {
+                                    let static_place = self.pt.static_place(*id);
+                                    actions.push(Box::new(move |pt| {
+                                        pt.set_ref(target, static_place, None);
                                     }));
                                 }
                             }

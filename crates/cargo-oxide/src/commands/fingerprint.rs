@@ -194,6 +194,7 @@ pub(super) fn sanitize_codegen_fingerprint_with_env(
         unchecked_indexing,
         materialize_cubin: materialization.enabled(),
         device_debug,
+        debug_assertions: false,
     };
     let base = passthrough_codegen_fingerprint_with_env(
         ctx,
@@ -241,6 +242,7 @@ pub(super) fn standard_codegen_fingerprint(
         unchecked_indexing,
         materialize_cubin: materialization.enabled(),
         device_debug,
+        debug_assertions: false,
     };
     let base = passthrough_codegen_fingerprint(ctx, &opts, None, target_arch, materialization);
     let mut hash = sha2::Sha256::new();
